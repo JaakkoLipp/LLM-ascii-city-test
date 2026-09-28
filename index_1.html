@@ -1,0 +1,2075 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NEON GRID - ASCII CITY</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:#000; }
+  canvas#screen { display:block; background:#000; cursor:crosshair; }
+  #overlay { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); padding:16px 24px;
+    border:1px solid rgba(80,255,170,.45); background:rgba(0,8,6,.84); color:#7dffb4;
+    font:14px/1.45 "Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,"Courier New",monospace;
+    white-space:pre; pointer-events:none; text-shadow:0 0 8px rgba(80,255,170,.55); }
+  #overlay.hidden { display:none; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="screen"></canvas></div>
+<div id="overlay"></div>
+<script>
+(function () {
+'use strict';
+
+/* ==========================================================================
+   1. CONFIGURATION
+   ========================================================================== */
+const CFG = {
+  fovDeg: 78,
+  viewDist: 120,
+  colSteps: [80, 100, 120, 140, 160, 190],
+  quality: 3,
+  autoQuality: true,
+  eye: 1.7, radius: 0.32,
+  walk: 4.0, sprint: 7.4, accel: 11,
+  mouseSens: 0.0022,
+  ambient: 0.30, ambientIn: 0.24,
+  fogK: 0.026, fogEmit: 0.0085,
+  fog: [0.020, 0.034, 0.050],
+  carCount: 15, pedCount: 26,
+  edgeMax: 65
+};
+const SX = 136, SY = 136, SZ = 40, SXY = SX * SY;
+const FLOOR_H = 4;
+const ROAD_C = [11, 49, 87, 125];
+const BLOCK_O = [16, 54, 92];
+const BLOCK = 28, WALK_W = 3, ROAD_HALF = 5, PERIM = 6;
+const LANE_OFF = 1.7, STOP_D = 10.2, ENTRY_D = 7;
+const T_LOT = 1, T_ROAD = 2, T_WALK = 3, T_ALLEY = 4, T_BLDG = 5, T_PARK = 6, T_WALL = 7;
+const DISTRICTS = ['OLD PORT', 'SIGNAL HILL', 'KALLIO-9', 'CIRCUIT ROW', 'NOODLE SQUARE',
+                   'CHROME ALLEY', 'SERVER YARD', 'LOTUS MARKET', 'SKYLINE 7'];
+let SEED = 20260928;
+let TIME = 0;
+
+/* ==========================================================================
+   2. UTILITIES
+   ========================================================================== */
+const clamp = (v, a, b) => (v < a ? a : (v > b ? b : v));
+function hash3(x, y, z, s) {
+  let h = Math.imul(x | 0, 0x27d4eb2d) ^ Math.imul(y | 0, 0x165667b1) ^
+          Math.imul(z | 0, 0x9e3779b1) ^ Math.imul((s | 0) + 0x1234567, 0x85ebca6b);
+  h ^= h >>> 15; h = Math.imul(h, 0x2c1b3c6d);
+  h ^= h >>> 12; h = Math.imul(h, 0x297a2d39);
+  h ^= h >>> 15;
+  return (h >>> 0) / 4294967296;
+}
+function makeRng(seed) {
+  let a = seed >>> 0;
+  const r = function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  r.int = (lo, hi) => lo + Math.floor(r() * (hi - lo + 1));
+  r.range = (lo, hi) => lo + r() * (hi - lo);
+  r.pick = (arr) => arr[Math.floor(r() * arr.length)];
+  r.chance = (p) => r() < p;
+  r.shuffle = (arr) => { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); const t = arr[i]; arr[i] = arr[j]; arr[j] = t; } return arr; };
+  return r;
+}
+function strSeed(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+function parseSeedFromUrl() {
+  try {
+    const src = (location.hash || '') + '&' + (location.search || '');
+    const m = /seed=([^&#]+)/.exec(src);
+    if (m) { const v = decodeURIComponent(m[1]); return /^-?\d+$/.test(v) ? (parseInt(v, 10) >>> 0) : strSeed(v); }
+  } catch (e) { /* ignore */ }
+  return 20260928;
+}
+
+/* ==========================================================================
+   3. MATERIALS
+   ========================================================================== */
+const matAlb = new Float32Array(256 * 3), matEmi = new Float32Array(256 * 3), matFlags = new Uint8Array(256);
+const F_GLASS = 1, F_NOEDGE = 2, F_WIN = 4, F_NOOCC = 8;
+let matCount = 0;
+function defMat(alb, emi, flags) {
+  const id = ++matCount;
+  matAlb[id * 3] = alb[0]; matAlb[id * 3 + 1] = alb[1]; matAlb[id * 3 + 2] = alb[2];
+  if (emi) { matEmi[id * 3] = emi[0]; matEmi[id * 3 + 1] = emi[1]; matEmi[id * 3 + 2] = emi[2]; }
+  matFlags[id] = flags || 0;
+  return id;
+}
+const M_ASPHALT = defMat([0.085, 0.095, 0.115]);
+const M_LINEY = defMat([0.60, 0.48, 0.10]);
+const M_LINEW = defMat([0.60, 0.62, 0.64]);
+const M_SIDEW = defMat([0.19, 0.21, 0.24]);
+const M_CURB = defMat([0.34, 0.36, 0.39]);
+const M_GRASS = defMat([0.05, 0.17, 0.07]);
+const M_CONC = defMat([0.16, 0.17, 0.19]);
+const M_WCONC = defMat([0.30, 0.33, 0.37], null, F_WIN);
+const M_WBRICK = defMat([0.36, 0.20, 0.18], null, F_WIN);
+const M_WGLASS = defMat([0.14, 0.24, 0.32], null, F_WIN);
+const M_WPANEL = defMat([0.22, 0.25, 0.30], null, F_WIN);
+const M_ROOF = defMat([0.16, 0.17, 0.20]);
+const M_METAL = defMat([0.24, 0.27, 0.30]);
+const M_DUMP = defMat([0.10, 0.28, 0.16]);
+const M_CRATE = defMat([0.34, 0.26, 0.13]);
+const M_BENCH = defMat([0.30, 0.20, 0.10]);
+const M_TRUNK = defMat([0.22, 0.15, 0.09], null, F_NOOCC);
+const M_LEAF = defMat([0.07, 0.36, 0.14], null, F_NOEDGE | F_NOOCC);
+const M_POLE = defMat([0.20, 0.22, 0.25], null, F_NOOCC);
+const M_LAMP = defMat([0.10, 0.10, 0.10], [4.0, 2.9, 1.5], F_NOOCC | F_NOEDGE);
+const M_SIGN = defMat([0.04, 0.04, 0.05], null, F_NOOCC | F_NOEDGE);
+const M_NMAG = defMat([0.05, 0.02, 0.04], [1.6, 0.25, 1.1], F_NOEDGE);
+const M_NCYA = defMat([0.02, 0.05, 0.06], [0.15, 1.2, 1.7], F_NOEDGE);
+const M_NAMB = defMat([0.05, 0.04, 0.02], [1.7, 0.9, 0.15], F_NOEDGE);
+const M_NGRN = defMat([0.02, 0.05, 0.02], [0.3, 1.6, 0.35], F_NOEDGE);
+const M_NRED = defMat([0.05, 0.02, 0.02], [1.8, 0.15, 0.15], F_NOEDGE);
+const M_NWHT = defMat([0.05, 0.05, 0.05], [1.4, 1.5, 1.6], F_NOEDGE);
+const M_GLASS = defMat([0.06, 0.14, 0.18], null, F_GLASS | F_NOOCC | F_NOEDGE);
+const M_DOOR = defMat([0.16, 0.19, 0.24]);
+const M_FLOORI = defMat([0.15, 0.14, 0.20]);
+const M_WALLI = defMat([0.26, 0.22, 0.32]);
+const M_CEIL = defMat([0.12, 0.12, 0.16]);
+const M_BAR = defMat([0.22, 0.20, 0.26]);
+const M_TABLE = defMat([0.30, 0.22, 0.16]);
+const M_STOOL = defMat([0.30, 0.10, 0.28]);
+const M_TERM = defMat([0.08, 0.09, 0.10]);
+const M_SHELF = defMat([0.14, 0.12, 0.16]);
+const M_CARB = defMat([0.30, 0.30, 0.30]);
+const M_TLR = defMat([0.03, 0.03, 0.04], null, F_NOOCC | F_NOEDGE);
+const M_TLY = defMat([0.03, 0.03, 0.04], null, F_NOOCC | F_NOEDGE);
+const M_TLG = defMat([0.03, 0.03, 0.04], null, F_NOOCC | F_NOEDGE);
+const M_VEND = defMat([0.10, 0.10, 0.13]);
+const M_BOUND = defMat([0.05, 0.06, 0.08], null, F_NOEDGE);
+const M_BLINK = defMat([0.10, 0.02, 0.02], [2.4, 0.2, 0.2], F_NOOCC | F_NOEDGE);
+const NEON_MATS = [M_NMAG, M_NCYA, M_NAMB, M_NGRN, M_NRED, M_NWHT];
+const NEON_PAL = [[1.7, 0.25, 1.2], [0.2, 1.3, 1.8], [1.8, 1.0, 0.2], [0.35, 1.7, 0.4], [1.9, 0.2, 0.2], [0.6, 0.4, 1.9]];
+const CAR_PAINT = [[0.55, 0.57, 0.60], [0.50, 0.06, 0.06], [0.06, 0.28, 0.32], [0.62, 0.50, 0.06], [0.10, 0.12, 0.30], [0.16, 0.16, 0.18]];
+const neonF = new Float32Array(256).fill(1);
+const FOGN = 1800, FOGS = 8;
+const FA_O = new Float32Array(FOGN), FE_O = new Float32Array(FOGN), FA_I = new Float32Array(FOGN), FE_I = new Float32Array(FOGN);
+for (let i = 0; i < FOGN; i++) {
+  const d = i / FOGS;
+  FA_O[i] = Math.exp(-d * CFG.fogK); FE_O[i] = Math.exp(-d * CFG.fogEmit);
+  FA_I[i] = Math.exp(-d * CFG.fogK * 0.35); FE_I[i] = Math.exp(-d * CFG.fogEmit * 0.35);
+}
+const TL_COL = [[2.6, 0.2, 0.15], [2.6, 1.6, 0.1], [0.2, 2.4, 0.55]];
+
+/* 3x5 bitmap font for neon signs */
+const FONT_SRC = {
+  A: '010101111101101', B: '110101110101110', C: '011100100100011', D: '110101101101110',
+  E: '111100110100111', F: '111100110100100', G: '011100101101011', H: '101101111101101',
+  I: '111010010010111', J: '001001001101010', K: '101101110101101', L: '100100100100111',
+  M: '101111111101101', N: '110101101101101', O: '010101101101010', P: '110101110100100',
+  Q: '010101101111011', R: '110101110101101', S: '011100010001110', T: '111010010010010',
+  U: '101101101101111', V: '101101101101010', W: '101101111111101', X: '101101010101101',
+  Y: '101101010010010', Z: '111001010100111',
+  0: '111101101101111', 1: '010110010010111', 2: '110001010100111', 3: '110001010001110',
+  4: '101101111001001', 5: '111100110001110', 6: '011100111101111', 7: '111001010010010',
+  8: '111101111101111', 9: '111101111001110',
+  '-': '000000111000000', '!': '010010010000010', '.': '000000000000010', ' ': '000000000000000',
+  '/': '001001010100100', '+': '000010111010000'
+};
+
+/* ==========================================================================
+   4. WORLD DATA
+   ========================================================================== */
+const vox = new Uint8Array(SXY * SZ);
+const tileKind = new Uint8Array(SXY), tileBid = new Uint8Array(SXY);
+const tileZone = new Uint8Array(SXY), tileAux = new Uint8Array(SXY);
+const blocked = new Uint8Array(SXY), colTop = new Uint8Array(SXY);
+const signMap = new Map();
+let signs = [];
+const buildings = [];
+const bStyle = new Uint8Array(256), bLit = new Float32Array(256), bTint = new Float32Array(256 * 3);
+let interactables = [];
+let lightsRaw = [];
+let rng = null;
+const world = { spawn: { x: 64, y: 42.5, yaw: Math.PI / 2 }, doorOpen: false };
+const game = { credits: 40, msg: null, msgUntil: 0, termPage: 0, npcLine: 0, cur: null };
+
+function setV(x, y, z, m) { if (x >= 0 && x < SX && y >= 0 && y < SY && z >= 0 && z < SZ) vox[(z * SY + y) * SX + x] = m; }
+function getV(x, y, z) { if (x < 0 || x >= SX || y < 0 || y >= SY || z < 0 || z >= SZ) return 255; return vox[(z * SY + y) * SX + x]; }
+function fillBox(x0, y0, z0, x1, y1, z1, m) {
+  for (let z = z0; z < z1; z++) for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) setV(x, y, z, m);
+}
+function isAirBox(x0, y0, z0, x1, y1, z1) {
+  for (let z = z0; z < z1; z++) for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) if (getV(x, y, z) !== 0) return false;
+  return true;
+}
+function putGround(x, y, m) { if (x >= 0 && x < SX && y >= 0 && y < SY) vox[y * SX + x] = m; }
+function addLight(x, y, z, col, intensity, radius, zone, flick, shadow) {
+  lightsRaw.push({ x, y, z, r: col[0] * intensity, g: col[1] * intensity, b: col[2] * intensity,
+                   rad: radius, zone: zone, flick: flick || 0, shadow: shadow ? 1 : 0 });
+}
+
+/* ---------- signs ---------- */
+function makeBits(text, vertical) {
+  const n = text.length;
+  let bw, bh;
+  if (!vertical) { bw = n * 4 + 1; bh = 7; } else { bw = 5; bh = n * 6 + 1; }
+  const bits = new Uint8Array(bw * bh);
+  for (let k = 0; k < n; k++) {
+    const g = FONT_SRC[text[k]] || FONT_SRC[' '];
+    const ox = vertical ? 1 : 1 + k * 4;
+    const oy = vertical ? 1 + k * 6 : 1;
+    for (let r = 0; r < 5; r++) for (let c = 0; c < 3; c++) if (g.charCodeAt(r * 3 + c) === 49) bits[(oy + r) * bw + ox + c] = 1;
+  }
+  return { bits, bw, bh };
+}
+function signDims(text, vertical, big) {
+  const b = makeBits(text, vertical);
+  let W, H;
+  if (!vertical) { if (big) { H = 4; W = Math.round(b.bw * 4 / 7); } else { H = 3; W = Math.round(b.bw * 3 / 7); } }
+  else { W = 2; H = Math.round(b.bh * 0.42); }
+  return { bits: b.bits, bw: b.bw, bh: b.bh, W, H };
+}
+/* a = normal axis (0 = x, 1 = y). (x0,y0,z0) = min corner. */
+function placeSign(o) {
+  const d = signDims(o.text, o.vertical, o.big);
+  const dx = o.a === 0 ? 1 : d.W, dy = o.a === 0 ? d.W : 1, dz = d.H;
+  if (!isAirBox(o.x0, o.y0, o.z0, o.x0 + dx, o.y0 + dy, o.z0 + dz)) return null;
+  const ci = o.col !== undefined ? o.col : rng.int(0, NEON_PAL.length - 1);
+  const c = NEON_PAL[ci];
+  const sg = { a: o.a, x0: o.x0, y0: o.y0, z0: o.z0, W: d.W, H: d.H, bits: d.bits, bw: d.bw, bh: d.bh,
+               c0: c[0], c1: c[1], c2: c[2], fl: 1, flick: o.flick !== undefined ? o.flick : rng.range(0, 0.5), id: signs.length };
+  signs.push(sg);
+  for (let z = o.z0; z < o.z0 + dz; z++) for (let y = o.y0; y < o.y0 + dy; y++) for (let x = o.x0; x < o.x0 + dx; x++) {
+    setV(x, y, z, M_SIGN);
+    signMap.set((z * SY + y) * SX + x, sg);
+  }
+  const cx = o.x0 + dx / 2, cy = o.y0 + dy / 2, cz = o.z0 + dz / 2;
+  const off = o.lightOffset || [0, 0];
+  addLight(cx + off[0], cy + off[1], cz, c, o.big ? 1.3 : 0.85, o.big ? 16 : 10, 0, sg.flick, false);
+  return sg;
+}
+
+/* ==========================================================================
+   5. PROCEDURAL GENERATION
+   ========================================================================== */
+function roadIdx(t) { for (let k = 0; k < 4; k++) { const c = ROAD_C[k]; if (t >= c - ROAD_HALF && t < c + ROAD_HALF) return k; } return -1; }
+function nearNode(t) { for (let k = 0; k < 4; k++) if (Math.abs(t - ROAD_C[k]) < 9.5) return true; return false; }
+
+function paintTerrain() {
+  for (let y = 0; y < SY; y++) for (let x = 0; x < SX; x++) {
+    const ti = y * SX + x;
+    if (x < PERIM || x >= SX - PERIM || y < PERIM || y >= SY - PERIM) {
+      tileKind[ti] = T_WALL;
+      for (let z = 0; z < 30; z++) vox[z * SXY + ti] = M_BOUND;
+    } else { tileKind[ti] = T_LOT; vox[ti] = M_CONC; }
+  }
+  for (let y = PERIM; y < SY - PERIM; y++) for (let x = PERIM; x < SX - PERIM; x++) {
+    const rx = roadIdx(x), ry = roadIdx(y);
+    if (rx < 0 && ry < 0) continue;
+    const ti = y * SX + x;
+    tileKind[ti] = T_ROAD;
+    let m = M_ASPHALT;
+    if (rx >= 0 && ry < 0) { if (x === ROAD_C[rx] - 1 && (y & 3) < 2 && !nearNode(y)) m = M_LINEY; }
+    else if (ry >= 0 && rx < 0) { if (y === ROAD_C[ry] - 1 && (x & 3) < 2 && !nearNode(x)) m = M_LINEY; }
+    vox[ti] = m;
+  }
+  for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) {
+    const cx = ROAD_C[i], cy = ROAD_C[j];
+    if (i < 3) {
+      for (let y = cy - 5; y < cy + 5; y++) for (let x = cx + 5; x < cx + 7; x++) if (((y - (cy - 5)) & 1) === 0) putGround(x, y, M_LINEW);
+      for (let y = cy; y < cy + 5; y++) putGround(cx + 7, y, M_LINEW);
+    }
+    if (i > 0) {
+      for (let y = cy - 5; y < cy + 5; y++) for (let x = cx - 7; x < cx - 5; x++) if (((y - (cy - 5)) & 1) === 0) putGround(x, y, M_LINEW);
+      for (let y = cy - 5; y < cy; y++) putGround(cx - 8, y, M_LINEW);
+    }
+    if (j < 3) {
+      for (let x = cx - 5; x < cx + 5; x++) for (let y = cy + 5; y < cy + 7; y++) if (((x - (cx - 5)) & 1) === 0) putGround(x, y, M_LINEW);
+      for (let x = cx - 5; x < cx; x++) putGround(x, cy + 7, M_LINEW);
+    }
+    if (j > 0) {
+      for (let x = cx - 5; x < cx + 5; x++) for (let y = cy - 7; y < cy - 5; y++) if (((x - (cx - 5)) & 1) === 0) putGround(x, y, M_LINEW);
+      for (let x = cx; x < cx + 5; x++) putGround(x, cy - 8, M_LINEW);
+    }
+  }
+  for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) {
+    const bx = BLOCK_O[i], by = BLOCK_O[j];
+    for (let ly = 0; ly < BLOCK; ly++) for (let lx = 0; lx < BLOCK; lx++) {
+      const x = bx + lx, y = by + ly, ti = y * SX + x;
+      const edge = lx < WALK_W || lx >= BLOCK - WALK_W || ly < WALK_W || ly >= BLOCK - WALK_W;
+      if (edge) {
+        tileKind[ti] = T_WALK;
+        const curb = lx === 0 || lx === BLOCK - 1 || ly === 0 || ly === BLOCK - 1;
+        vox[ti] = curb ? M_CURB : M_SIDEW;
+      } else { tileKind[ti] = T_LOT; vox[ti] = M_CONC; }
+    }
+  }
+}
+
+/* ---------- props ---------- */
+function placeLamp(x, y) {
+  if (getV(x, y, 1) !== 0) return;
+  fillBox(x, y, 1, x + 1, y + 1, 6, M_POLE);
+  setV(x, y, 6, M_LAMP);
+  const cool = rng.chance(0.25);
+  addLight(x + 0.5, y + 0.5, 6.4, cool ? [0.62, 0.9, 1.0] : [1.0, 0.78, 0.45], 2.2, 16, 0, 0.04, true);
+}
+function placeTree(x, y) {
+  if (getV(x, y, 1) !== 0) return;
+  fillBox(x, y, 1, x + 1, y + 1, 4, M_TRUNK);
+  for (let dz = 0; dz < 3; dz++) {
+    const r = dz === 1 ? 2 : 1;
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+      if (Math.abs(dx) === r && Math.abs(dy) === r && r === 2) continue;
+      if (dz === 2 && (Math.abs(dx) + Math.abs(dy)) > 1) continue;
+      if (hash3(x + dx, y + dy, 4 + dz, SEED) < 0.16) continue;
+      if (getV(x + dx, y + dy, 4 + dz) === 0) setV(x + dx, y + dy, 4 + dz, M_LEAF);
+    }
+  }
+}
+function placeTrafficPole(x, y) {
+  if (getV(x, y, 1) !== 0) return;
+  setV(x, y, 1, M_POLE); setV(x, y, 2, M_POLE);
+  setV(x, y, 3, M_TLG); setV(x, y, 4, M_TLY); setV(x, y, 5, M_TLR);
+}
+function placeParkedCar(x, y, axis) {
+  const dx = axis === 0 ? 4 : 2, dy = axis === 0 ? 2 : 4;
+  if (Math.abs(x + dx / 2 - world.spawn.x) < 8 && Math.abs(y + dy / 2 - world.spawn.y) < 7) return false;
+  if (!isAirBox(x, y, 1, x + dx, y + dy, 3)) return false;
+  for (let yy = y; yy < y + dy; yy++) for (let xx = x; xx < x + dx; xx++) {
+    const k = tileKind[yy * SX + xx];
+    if (k === T_WALK || k === T_BLDG || k === T_WALL) return false;
+  }
+  const col = rng.int(0, CAR_PAINT.length - 1) + 1;
+  fillBox(x, y, 1, x + dx, y + dy, 2, M_CARB);
+  for (let yy = y; yy < y + dy; yy++) for (let xx = x; xx < x + dx; xx++) {
+    const pos = axis === 0 ? xx - x : yy - y;
+    tileAux[yy * SX + xx] = col | (pos << 4);
+  }
+  return true;
+}
+
+function decorateBlock(i, j) {
+  const bx = BLOCK_O[i], by = BLOCK_O[j];
+  const sides = [
+    (p) => [bx + p, by], (p) => [bx + p, by + BLOCK - 1],
+    (p) => [bx, by + p], (p) => [bx + BLOCK - 1, by + p]
+  ];
+  for (const s of sides) {
+    placeLamp(...s(6)); placeLamp(...s(21));
+    if (rng.chance(0.8)) placeTree(...s(13));
+    if (rng.chance(0.5)) { const a = s(17), b = s(18); if (getV(a[0], a[1], 1) === 0 && getV(b[0], b[1], 1) === 0) { setV(a[0], a[1], 1, M_BENCH); setV(b[0], b[1], 1, M_BENCH); } }
+    if (rng.chance(0.5)) { const a = s(3); if (getV(a[0], a[1], 1) === 0) setV(a[0], a[1], 1, M_METAL); }
+  }
+  for (const c of [[0, 0], [BLOCK - 1, 0], [0, BLOCK - 1], [BLOCK - 1, BLOCK - 1]]) placeTrafficPole(bx + c[0], by + c[1]);
+}
+
+function decorateAlley(r) {
+  const vertical = r.h > r.w;
+  const L = vertical ? r.h : r.w;
+  for (let y = r.y; y < r.y + r.h; y++) for (let x = r.x; x < r.x + r.w; x++) {
+    tileKind[y * SX + x] = T_ALLEY; vox[y * SX + x] = M_CONC;
+  }
+  if (L < 9) return;
+  const nProps = rng.int(1, 3);
+  for (let k = 0; k < nProps; k++) {
+    const pos = rng.int(4, L - 6);
+    const side = rng.chance(0.5) ? 0 : r.w - 1;
+    const sideV = rng.chance(0.5) ? 0 : r.h - 1;
+    const kind = rng.int(0, 2);
+    if (vertical) {
+      const x = r.x + (r.w > 1 ? side : 0), y = r.y + pos;
+      if (kind === 0) { if (isAirBox(x, y, 1, x + 1, y + 2, 2)) fillBox(x, y, 1, x + 1, y + 2, 2, M_DUMP); }
+      else { if (isAirBox(x, y, 1, x + 1, y + 1, 3)) { setV(x, y, 1, M_CRATE); if (kind === 2) setV(x, y, 2, M_CRATE); } }
+    } else {
+      const y = r.y + (r.h > 1 ? sideV : 0), x = r.x + pos;
+      if (kind === 0) { if (isAirBox(x, y, 1, x + 2, y + 1, 2)) fillBox(x, y, 1, x + 2, y + 1, 2, M_DUMP); }
+      else { if (isAirBox(x, y, 1, x + 1, y + 1, 3)) { setV(x, y, 1, M_CRATE); if (kind === 2) setV(x, y, 2, M_CRATE); } }
+    }
+  }
+  /* overhead pipe with a light fixture */
+  const pos = Math.floor(L / 2) + rng.int(-2, 2);
+  const mats = [M_NCYA, M_NMAG, M_NAMB];
+  const ci = rng.int(0, 2);
+  for (let t = 0; t < (vertical ? r.w : r.h); t++) {
+    const x = vertical ? r.x + t : r.x + pos, y = vertical ? r.y + pos : r.y + t;
+    if (getV(x, y, 6) === 0) setV(x, y, 6, M_METAL);
+  }
+  const fx = vertical ? r.x + (r.w >> 1) : r.x + pos, fy = vertical ? r.y + pos : r.y + (r.h >> 1);
+  if (getV(fx, fy, 5) === 0) setV(fx, fy, 5, mats[ci]);
+  addLight(fx + 0.5, fy + 0.5, 4.6, NEON_PAL[[1, 0, 2][ci]], 2.4, 11, 0, 0.5, false);
+}
+
+function makePark(r) {
+  const cx = r.x + (r.w >> 1), cy = r.y + (r.h >> 1);
+  for (let y = r.y; y < r.y + r.h; y++) for (let x = r.x; x < r.x + r.w; x++) { tileKind[y * SX + x] = T_PARK; vox[y * SX + x] = M_GRASS; }
+  for (let x = r.x; x < r.x + r.w; x++) putGround(x, cy, M_SIDEW);
+  for (let y = r.y; y < r.y + r.h; y++) putGround(cx, y, M_SIDEW);
+  const n = rng.int(4, 7);
+  for (let k = 0; k < n; k++) {
+    const x = rng.int(r.x + 1, r.x + r.w - 2), y = rng.int(r.y + 1, r.y + r.h - 2);
+    if (x === cx || y === cy || Math.abs(x - cx) + Math.abs(y - cy) < 4) continue;
+    placeTree(x, y);
+  }
+  for (const b of [[cx + 1, cy + 2], [cx + 2, cy + 2], [cx - 2, cy - 3], [cx - 3, cy - 3]]) if (getV(b[0], b[1], 1) === 0) setV(b[0], b[1], 1, M_BENCH);
+  const ox = cx + 2, oy = cy - 3;
+  if (getV(ox, oy, 1) === 0) {
+    for (let z = 1; z <= 6; z++) setV(ox, oy, z, (z & 1) ? M_NCYA : M_NMAG);
+    addLight(ox + 0.5, oy + 0.5, 4, [0.4, 0.9, 1.5], 2.6, 15, 0, 0.1, false);
+  }
+  placeLamp(cx - 1, cy + 1);
+}
+
+function makeParking(r) {
+  for (let y = r.y; y < r.y + r.h; y++) for (let x = r.x; x < r.x + r.w; x++) { tileKind[y * SX + x] = T_LOT; vox[y * SX + x] = M_CONC; }
+  const rowsY = [r.y + 1, r.y + r.h - 5];
+  for (const ry of rowsY) {
+    if (ry < r.y || ry + 4 > r.y + r.h) continue;
+    for (let x = r.x + 1; x + 2 <= r.x + r.w - 1; x += 3) {
+      for (let y = ry; y < ry + 4; y++) putGround(x - 1, y, M_LINEW);
+      if (rng.chance(0.6)) placeParkedCar(x, ry, 1);
+    }
+  }
+  placeLamp(r.x + (r.w >> 1), r.y + (r.h >> 1));
+}
+
+/* ---------- buildings ---------- */
+const SIGN_WORDS = ['BAR', '24H', 'HOTEL', 'RAMEN', 'SUSHI', 'CYBER', 'ARCADE', 'PHARMA', 'NOODLE', 'CLUB', 'TECH',
+                    'NEON', 'DATA', 'MOTEL', 'GAMES', 'CAFE', 'BOOKS', 'VIDEO', 'LOTUS', 'OMEGA', 'SYNTH', 'CHROME',
+                    'DELI', 'TAXI', 'CLINIC', 'PIZZA', 'SAKE', 'ROBOT', 'VR'];
+function sideOpen(b, s) {
+  let x, y;
+  if (s === 0) { x = b.x + (b.w >> 1); y = b.y - 1; }
+  else if (s === 1) { x = b.x + (b.w >> 1); y = b.y + b.h; }
+  else if (s === 2) { x = b.x - 1; y = b.y + (b.h >> 1); }
+  else { x = b.x + b.w; y = b.y + (b.h >> 1); }
+  const k = tileKind[y * SX + x];
+  return k === T_WALK || k === T_ALLEY || k === T_LOT || k === T_ROAD;
+}
+function tryFacadeSign(b, s, text, vertical, z0) {
+  const d = signDims(text, vertical, false);
+  const along = (s < 2) ? b.w : b.h;
+  if (!vertical && d.W > along - 2) return false;
+  let x0, y0, a;
+  if (!vertical) {
+    if (s < 2) { a = 1; x0 = b.x + rng.int(1, along - d.W - 1); y0 = s === 0 ? b.y - 1 : b.y + b.h; }
+    else { a = 0; y0 = b.y + rng.int(1, along - d.W - 1); x0 = s === 2 ? b.x - 1 : b.x + b.w; }
+  } else {
+    if (s < 2) { a = 0; x0 = b.x + rng.int(1, along - 2); y0 = s === 0 ? b.y - d.W : b.y + b.h; }
+    else { a = 1; y0 = b.y + rng.int(1, along - 2); x0 = s === 2 ? b.x - d.W : b.x + b.w; }
+  }
+  const off = [s === 2 ? -2 : (s === 3 ? 2 : 0), s === 0 ? -2 : (s === 1 ? 2 : 0)];
+  if (vertical) { off[0] = s === 2 ? -1 : (s === 3 ? 1 : 0); off[1] = s === 0 ? -1 : (s === 1 ? 1 : 0); }
+  return !!placeSign({ text, vertical, a, x0, y0, z0, lightOffset: off });
+}
+function facadeDetails(b) {
+  const sides = rng.shuffle([0, 1, 2, 3]);
+  let nSigns = 0;
+  for (const s of sides) {
+    if (!sideOpen(b, s)) continue;
+    if (nSigns < 2 && rng.chance(0.65)) {
+      for (let tries = 0; tries < 4; tries++) {
+        if (tryFacadeSign(b, s, rng.pick(SIGN_WORDS), false, 5 + rng.int(0, 1))) { nSigns++; break; }
+      }
+    }
+    if (rng.chance(0.4)) {
+      for (let tries = 0; tries < 3; tries++) {
+        if (tryFacadeSign(b, s, rng.pick(['BAR', '24H', 'VR', 'HOTEL', 'CLUB', 'TAXI', 'SAKE']), true, 4 + rng.int(0, 2))) break;
+      }
+    }
+  }
+  const top = b.f1 * FLOOR_H;
+  if (rng.chance(b.style === 3 ? 0.9 : 0.3)) {
+    const s = rng.int(0, 3);
+    const m = rng.pick(NEON_MATS);
+    const t = rng.int(1, ((s < 2) ? b.w : b.h) - 2);
+    for (let z = 1; z < top; z++) {
+      const x = s < 2 ? b.x + t : (s === 2 ? b.x : b.x + b.w - 1);
+      const y = s < 2 ? (s === 0 ? b.y : b.y + b.h - 1) : b.y + t;
+      if (getV(x, y, z) !== 0 && getV(x, y, z) !== M_GLASS) setV(x, y, z, m);
+    }
+  }
+  const nB = rng.int(0, 3);
+  for (let k = 0; k < nB && b.f1 >= 3; k++) {
+    const s = rng.int(0, 3);
+    if (!sideOpen(b, s)) continue;
+    const f = rng.int(1, b.f1 - 1), z = 1 + f * FLOOR_H;
+    const t = rng.int(1, ((s < 2) ? b.w : b.h) - 4);
+    let x0, y0, x1, y1;
+    if (s < 2) { x0 = b.x + t; x1 = x0 + 3; y0 = s === 0 ? b.y - 1 : b.y + b.h; y1 = y0 + 1; }
+    else { y0 = b.y + t; y1 = y0 + 3; x0 = s === 2 ? b.x - 1 : b.x + b.w; x1 = x0 + 1; }
+    if (isAirBox(x0, y0, z, x1, y1, z + 1)) fillBox(x0, y0, z, x1, y1, z + 1, M_ROOF);
+  }
+  for (let k = 0; k < 4; k++) {
+    const s = rng.int(0, 3);
+    if (!sideOpen(b, s)) continue;
+    const f = rng.int(1, Math.max(1, b.f1 - 1)), z = 2 + f * FLOOR_H;
+    const t = rng.int(1, ((s < 2) ? b.w : b.h) - 2);
+    const x = s < 2 ? b.x + t : (s === 2 ? b.x - 1 : b.x + b.w);
+    const y = s < 2 ? (s === 0 ? b.y - 1 : b.y + b.h) : b.y + t;
+    if (getV(x, y, z) === 0 && z >= 5) setV(x, y, z, M_METAL);
+  }
+}
+function roofFeatures(b) {
+  const r = b.roof, z = b.roofZ + 1;
+  if (rng.chance(0.4) && r.w >= 5 && r.h >= 5) {
+    for (let x = r.x; x < r.x + r.w; x++) { setV(x, r.y, z, M_ROOF); setV(x, r.y + r.h - 1, z, M_ROOF); }
+    for (let y = r.y; y < r.y + r.h; y++) { setV(r.x, y, z, M_ROOF); setV(r.x + r.w - 1, y, z, M_ROOF); }
+  }
+  const n = rng.int(1, 3);
+  for (let k = 0; k < n; k++) {
+    const type = rng.int(0, 3);
+    const x = rng.int(r.x + 2, Math.max(r.x + 2, r.x + r.w - 5)), y = rng.int(r.y + 2, Math.max(r.y + 2, r.y + r.h - 5));
+    if (type === 0) { if (isAirBox(x, y, z, x + 2, y + 2, z + 1)) fillBox(x, y, z, x + 2, y + 2, z + 1, M_METAL); }
+    else if (type === 1 && r.w >= 6 && r.h >= 6) {
+      if (isAirBox(x, y, z, x + 3, y + 3, z + 4)) {
+        for (const c of [[0, 0], [2, 0], [0, 2], [2, 2]]) fillBox(x + c[0], y + c[1], z, x + c[0] + 1, y + c[1] + 1, z + 2, M_METAL);
+        fillBox(x, y, z + 2, x + 3, y + 3, z + 4, M_CRATE);
+      }
+    } else if (type === 2) {
+      const h = rng.int(4, 8);
+      if (isAirBox(x, y, z, x + 1, y + 1, z + h)) { fillBox(x, y, z, x + 1, y + 1, z + h - 1, M_POLE); setV(x, y, z + h - 1, M_BLINK); }
+    } else { if (isAirBox(x, y, z, x + 1, y + 1, z + 3)) fillBox(x, y, z, x + 1, y + 1, z + rng.int(2, 3), M_METAL); }
+  }
+}
+
+function makeBuilding(fx, fy, fw, fh, opt) {
+  opt = opt || {};
+  if (buildings.length >= 250) return null;
+  const id = buildings.length + 1;
+  const style = opt.style !== undefined ? opt.style : rng.int(0, 3);
+  const mat = [M_WCONC, M_WBRICK, M_WGLASS, M_WPANEL][style];
+  const f1 = opt.floors || rng.int(2, 5);
+  let f2 = 0;
+  if (!opt.noTower && !opt.floors && rng.chance(0.55) && fw >= 8 && fh >= 8) f2 = rng.int(1, Math.min(4, 8 - f1));
+  const b = { id, x: fx, y: fy, w: fw, h: fh, style, f1, f2 };
+  buildings.push(b);
+  bStyle[id] = style;
+  bLit[id] = style === 2 ? rng.range(0.4, 0.8) : rng.range(0.2, 0.65);
+  const tn = rng.range(0.85, 1.15);
+  bTint[id * 3] = tn * rng.range(0.9, 1.1); bTint[id * 3 + 1] = tn * rng.range(0.9, 1.1); bTint[id * 3 + 2] = tn * rng.range(0.9, 1.1);
+  const h1 = f1 * FLOOR_H;
+  fillBox(fx, fy, 1, fx + fw, fy + fh, h1 + 1, mat);
+  fillBox(fx, fy, h1, fx + fw, fy + fh, h1 + 1, M_ROOF);
+  for (let y = fy; y < fy + fh; y++) for (let x = fx; x < fx + fw; x++) { tileKind[y * SX + x] = T_BLDG; tileBid[y * SX + x] = id; }
+  b.roofZ = h1; b.roof = { x: fx, y: fy, w: fw, h: fh };
+  if (f2 > 0) {
+    let t = rng.int(2, 3);
+    while (t > 1 && (fw - 2 * t < 4 || fh - 2 * t < 4)) t--;
+    const tx = fx + t, ty = fy + t, tw = fw - 2 * t, th = fh - 2 * t;
+    const h2 = h1 + f2 * FLOOR_H;
+    fillBox(tx, ty, h1 + 1, tx + tw, ty + th, h2 + 1, mat);
+    fillBox(tx, ty, h2, tx + tw, ty + th, h2 + 1, M_ROOF);
+    b.roofZ = h2; b.roof = { x: tx, y: ty, w: tw, h: th };
+  }
+  if (!opt.noSigns) facadeDetails(b);
+  roofFeatures(b);
+  return b;
+}
+
+function addBillboards() {
+  const cand = buildings.filter((b) => b.roof.w >= 10 && b.roofZ >= 12 && b.roofZ <= 28).sort((a, b) => b.roofZ - a.roofZ);
+  let placed = 0;
+  for (const b of cand) {
+    if (placed >= 3) break;
+    const words = ['NEON', 'OMEGA', 'CHROME', 'LOTUS', 'SYNTH', 'GRID'];
+    const text = rng.pick(words);
+    const d = signDims(text, false, true);
+    const r = b.roof;
+    if (d.W > r.w - 2) continue;
+    const z = b.roofZ + 1;
+    const x0 = r.x + ((r.w - d.W) >> 1), y0 = r.y + 1;
+    if (!isAirBox(x0, y0, z, x0 + d.W, y0 + 1, z + 2 + d.H)) continue;
+    fillBox(x0 + 1, y0, z, x0 + 2, y0 + 1, z + 2, M_METAL);
+    fillBox(x0 + d.W - 2, y0, z, x0 + d.W - 1, y0 + 1, z + 2, M_METAL);
+    if (placeSign({ text, vertical: false, big: true, a: 1, x0, y0, z0: z + 2, lightOffset: [0, -3] })) placed++;
+  }
+}
+
+/* ---------- lots and blocks ---------- */
+function bsp(r, depth, lots, alleys) {
+  const minS = 8, gap = rng.int(2, 3);
+  const canV = r.w >= 2 * minS + gap, canH = r.h >= 2 * minS + gap;
+  if ((depth === 0 || (depth < 2 && rng.chance(0.5))) && (canV || canH)) {
+    const vert = canV && (!canH || (r.w >= r.h ? rng.chance(0.75) : rng.chance(0.25)));
+    if (vert) {
+      const w1 = rng.int(minS, r.w - minS - gap);
+      alleys.push({ x: r.x + w1, y: r.y, w: gap, h: r.h });
+      bsp({ x: r.x, y: r.y, w: w1, h: r.h }, depth + 1, lots, alleys);
+      bsp({ x: r.x + w1 + gap, y: r.y, w: r.w - w1 - gap, h: r.h }, depth + 1, lots, alleys);
+    } else {
+      const h1 = rng.int(minS, r.h - minS - gap);
+      alleys.push({ x: r.x, y: r.y + h1, w: r.w, h: gap });
+      bsp({ x: r.x, y: r.y, w: r.w, h: h1 }, depth + 1, lots, alleys);
+      bsp({ x: r.x, y: r.y + h1 + gap, w: r.w, h: r.h - h1 - gap }, depth + 1, lots, alleys);
+    }
+  } else lots.push(r);
+}
+function buildLot(r, kind) {
+  if (kind === 'park') return makePark(r);
+  if (kind === 'lot') return makeParking(r);
+  const ins = [rng.int(0, 1), rng.int(0, 1), rng.int(0, 1), rng.int(0, 1)];
+  makeBuilding(r.x + ins[0], r.y + ins[2], r.w - ins[0] - ins[1], r.h - ins[2] - ins[3]);
+}
+
+/* ---------- the enterable noodle bar ---------- */
+function makeShop() {
+  const fx = 57, fy = 57, fw = 13, fh = 12;
+  makeBuilding(fx, fy, fw, fh, { floors: 3, style: 1, noTower: true, noSigns: true });
+  for (let y = fy + 1; y < fy + fh - 1; y++) for (let x = fx + 1; x < fx + fw - 1; x++) {
+    for (let z = 1; z <= 3; z++) setV(x, y, z, 0);
+    setV(x, y, 4, M_CEIL);
+    putGround(x, y, M_FLOORI);
+    tileZone[y * SX + x] = 1;
+  }
+  for (const x of [63, 64]) {
+    for (let z = 1; z <= 3; z++) setV(x, fy, z, 0);
+    setV(x, fy, 4, M_NCYA);
+    putGround(x, fy, M_FLOORI);
+    tileZone[fy * SX + x] = 1;
+  }
+  for (let z = 1; z <= 3; z++) {
+    for (const x of [58, 59, 60, 61, 66, 67, 68]) setV(x, fy, z, M_GLASS);
+    setV(62, fy, z, M_NMAG); setV(65, fy, z, M_NCYA);
+    for (let y = 59; y <= 66; y++) setV(fx, y, z, M_GLASS);
+  }
+  setV(62, fy, 4, M_NCYA); setV(65, fy, 4, M_NCYA);
+  /* ceiling light strips */
+  for (const y of [60, 65]) for (let x = 59; x <= 67; x++) setV(x, y, 4, ((x >> 1) & 1) ? M_NCYA : M_NMAG);
+  /* bar counter, shelves, stools, tables */
+  fillBox(60, 65, 1, 67, 66, 2, M_BAR);
+  fillBox(60, 67, 1, 68, 68, 4, M_SHELF);
+  for (const x of [60, 61, 66, 67]) setV(x, 64, 1, M_STOOL);
+  fillBox(59, 59, 1, 61, 61, 2, M_TABLE); fillBox(66, 59, 1, 68, 61, 2, M_TABLE);
+  setV(61, 59, 1, M_STOOL); setV(65, 60, 1, M_STOOL);
+  /* terminal and back door */
+  fillBox(68, 62, 1, 69, 63, 3, M_TERM);
+  for (let z = 1; z <= 3; z++) setV(69, 63, z, M_DOOR);
+  /* interior lights */
+  addLight(61, 62, 3.4, [0.3, 0.9, 1.2], 1.3, 10, 1, 0.1, false);
+  addLight(67, 62, 3.4, [1.2, 0.3, 0.9], 1.3, 10, 1, 0.1, false);
+  addLight(64, 66.3, 3.2, [1.2, 0.85, 0.5], 1.2, 8, 1, 0, false);
+  addLight(64, 59, 3.4, [0.9, 1.0, 1.1], 1.1, 10, 1, 0, false);
+  addLight(63.5, 55.2, 3.2, [1.0, 0.9, 0.8], 2.8, 9, 0, 0.05, false);
+  /* signs */
+  placeSign({ text: 'RAMEN', vertical: false, a: 1, x0: 60, y0: 56, z0: 5, col: 0, flick: 0.35, lightOffset: [0, -2] });
+  placeSign({ text: 'BAR', vertical: true, a: 0, x0: 58, y0: 55, z0: 5, col: 1, flick: 0.15, lightOffset: [0, -1] });
+  placeSign({ text: '24H', vertical: false, a: 0, x0: 56, y0: 60, z0: 5, col: 2, flick: 0.2, lightOffset: [-2, 0] });
+  /* vending machine on the sidewalk */
+  setV(60, 56, 1, M_VEND); setV(60, 56, 2, M_VEND); tileAux[56 * SX + 60] = 0;
+  interactables.push({ x: 60.5, y: 55.9, z: 1.6, r: 2.4, label: () => 'BUY NEON-COLA (3 CR)', act: () => vend() });
+  /* interactables */
+  interactables.push({ x: 68.5, y: 62.5, z: 1.6, r: 2.3, label: () => 'USE TERMINAL', act: () => useTerminal() });
+  interactables.push({ x: 64, y: 66.5, z: 1.6, r: 3.4, label: () => 'TALK TO BARTENDER', act: () => talkNpc() });
+  interactables.push({ x: 69.5, y: 63.5, z: 1.6, r: 2.3, label: () => (world.doorOpen ? 'CLOSE BACK DOOR' : 'OPEN BACK DOOR'), act: () => toggleDoor() });
+}
+
+function centralBlock(bx, by) {
+  makeShop();
+  makeBuilding(72, 57, 7, 22, { style: 2 });
+  makeBuilding(57, 71, 13, 8, { style: 0 });
+  decorateAlley({ x: 70, y: 57, w: 2, h: 22 });
+  decorateAlley({ x: 57, y: 69, w: 13, h: 2 });
+  setV(71, 60, 1, M_VEND); setV(71, 60, 2, M_VEND); tileAux[60 * SX + 71] = 1;
+  interactables.push({ x: 71.5, y: 60.5, z: 1.6, r: 2.2, label: () => 'BUY NEON-COLA (3 CR)', act: () => vend() });
+}
+
+function layoutBlock(i, j) {
+  const bx = BLOCK_O[i] + WALK_W, by = BLOCK_O[j] + WALK_W, S = BLOCK - 2 * WALK_W;
+  if (i === 1 && j === 1) { centralBlock(bx, by); return; }
+  const lots = [], alleys = [];
+  bsp({ x: bx, y: by, w: S, h: S }, 0, lots, alleys);
+  for (const a of alleys) decorateAlley(a);
+  let parks = 0;
+  for (const r of lots) {
+    const q = rng.range(0, 1);
+    if (q < 0.12 && parks < 2) { parks++; buildLot(r, 'park'); }
+    else if (q < 0.24) buildLot(r, 'lot');
+    else buildLot(r, 'bldg');
+  }
+}
+
+function placeRoadCars() {
+  for (let k = 0; k < 4; k++) for (let m = 0; m < 3; m++) for (const side of [0, 1]) for (const vertical of [true, false]) {
+    const c = ROAD_C[k], n0 = ROAD_C[m];
+    for (let slot = 0; slot < 4; slot++) {
+      if (!rng.chance(0.3)) continue;
+      const t0 = n0 + 9 + slot * 5;
+      if (vertical) { const x = side ? c + 3 : c - 5; placeParkedCar(x, t0, 1); }
+      else { const y = side ? c + 3 : c - 5; placeParkedCar(t0, y, 0); }
+    }
+  }
+}
+
+/* ---------- interactions ---------- */
+const TERM_PAGES = [
+  ['> NEON NOODLE TERMINAL V2.7', '> LINKING TO GRID... OK', '> WELCOME, WALKER.'],
+  ['> DISTRICT NOTICE', '> DRONE SWEEP AT 03:40.', '> STAY OFF THE MAIN AVENUE.'],
+  ['> TIP: THE BACK DOOR OPENS', '> TO THE ALLEY BEHIND THE BAR.', '> A VENDING UNIT IS THERE.'],
+  ['> SESSION CLOSED.']
+];
+const NPC_LINES = ['KAI: WELCOME TO THE NOODLE BAR.', 'KAI: RAIN AGAIN TONIGHT. GOOD FOR BUSINESS.',
+                   'KAI: THE SYNTH RAMEN IS BEST. TRUST ME.', 'KAI: WATCH THE TRAFFIC. IT STOPS FOR NO ONE.'];
+function showMsg(lines, secs) { game.msg = lines; game.msgUntil = TIME + secs; }
+function useTerminal() {
+  showMsg(TERM_PAGES[game.termPage % TERM_PAGES.length], 7);
+  game.termPage++;
+}
+function talkNpc() { showMsg([NPC_LINES[game.npcLine % NPC_LINES.length]], 5); game.npcLine++; }
+function vend() {
+  if (game.credits >= 3) { game.credits -= 3; showMsg(['CLUNK. YOU BOUGHT A NEON-COLA.', 'CREDITS LEFT: ' + game.credits], 3.5); }
+  else showMsg(['INSUFFICIENT CREDITS.'], 3);
+}
+function toggleDoor() {
+  world.doorOpen = !world.doorOpen;
+  for (let z = 1; z <= 3; z++) setV(69, 63, z, world.doorOpen ? 0 : M_DOOR);
+  blocked[63 * SX + 69] = world.doorOpen ? 0 : 1;
+  showMsg([world.doorOpen ? 'THE BACK DOOR SLIDES OPEN.' : 'THE BACK DOOR LOCKS.'], 2.5);
+}
+
+/* ---------- top level generation ---------- */
+function generateCity(seed) {
+  SEED = seed >>> 0;
+  rng = makeRng(SEED);
+  vox.fill(0); tileKind.fill(0); tileBid.fill(0); tileZone.fill(0); tileAux.fill(0);
+  signMap.clear(); signs = []; buildings.length = 0; bStyle.fill(0);
+  interactables = []; lightsRaw = [];
+  world.doorOpen = false; game.termPage = 0; game.npcLine = 0; game.msg = null; game.credits = 40;
+  paintTerrain();
+  for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) layoutBlock(i, j);
+  for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) decorateBlock(i, j);
+  placeRoadCars();
+  addBillboards();
+  finishWorld();
+}
+
+function finishWorld() {
+  for (let ti = 0; ti < SXY; ti++) {
+    let top = 1;
+    for (let z = SZ - 1; z >= 1; z--) {
+      const m = vox[z * SXY + ti];
+      if (m !== 0 && !(matFlags[m] & (F_NOOCC | F_GLASS))) { top = z + 1; break; }
+    }
+    colTop[ti] = top;
+    blocked[ti] = (vox[SXY + ti] !== 0 || vox[2 * SXY + ti] !== 0) ? 1 : 0;
+  }
+  /* spawn: keep the tile free */
+  const sp = world.spawn;
+  sp.x = 64.0; sp.y = 42.5; sp.yaw = Math.PI / 2;
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const x = Math.floor(sp.x) + dx, y = Math.floor(sp.y) + dy;
+    for (let z = 1; z <= 3; z++) if (getV(x, y, z) !== 0 && tileKind[y * SX + x] === T_WALK) setV(x, y, z, 0);
+    if (tileKind[y * SX + x] === T_WALK) blocked[y * SX + x] = 0;
+  }
+  buildLightGrid();
+  bakeGroundLight();
+}
+
+/* ==========================================================================
+   6. LIGHTS (flat arrays, bucketed on an 8 tile grid)
+   ========================================================================== */
+const NB = Math.ceil(SX / 8);
+let LN = 0, LX, LY, LZ, LRr, LGg, LBb, LRAD2, LINV, LZONE, LSH, LFL, LI;
+let bStart = new Int32Array(NB * NB + 1), bList = new Int16Array(1);
+const GLR = new Float32Array(SXY), GLG = new Float32Array(SXY), GLB = new Float32Array(SXY);
+const MAXDL = 16;
+const DLX = new Float32Array(MAXDL), DLY = new Float32Array(MAXDL), DLZ = new Float32Array(MAXDL);
+const DLR = new Float32Array(MAXDL), DLG = new Float32Array(MAXDL), DLB = new Float32Array(MAXDL);
+const DLRAD2 = new Float32Array(MAXDL), DLINV = new Float32Array(MAXDL);
+let dlN = 0;
+function buildLightGrid() {
+  LN = lightsRaw.length;
+  LX = new Float32Array(LN); LY = new Float32Array(LN); LZ = new Float32Array(LN);
+  LRr = new Float32Array(LN); LGg = new Float32Array(LN); LBb = new Float32Array(LN);
+  LRAD2 = new Float32Array(LN); LINV = new Float32Array(LN);
+  LZONE = new Uint8Array(LN); LSH = new Uint8Array(LN); LFL = new Float32Array(LN); LI = new Float32Array(LN).fill(1);
+  const counts = new Int32Array(NB * NB);
+  for (let k = 0; k < LN; k++) {
+    const L = lightsRaw[k];
+    LX[k] = L.x; LY[k] = L.y; LZ[k] = L.z; LRr[k] = L.r; LGg[k] = L.g; LBb[k] = L.b;
+    LRAD2[k] = L.rad * L.rad; LINV[k] = 1 / (L.rad * L.rad); LZONE[k] = L.zone; LSH[k] = L.shadow; LFL[k] = L.flick;
+    const x0 = clamp(Math.floor((L.x - L.rad) / 8), 0, NB - 1), x1 = clamp(Math.floor((L.x + L.rad) / 8), 0, NB - 1);
+    const y0 = clamp(Math.floor((L.y - L.rad) / 8), 0, NB - 1), y1 = clamp(Math.floor((L.y + L.rad) / 8), 0, NB - 1);
+    for (let by = y0; by <= y1; by++) for (let bx = x0; bx <= x1; bx++) counts[by * NB + bx]++;
+  }
+  bStart = new Int32Array(NB * NB + 1);
+  for (let i = 0; i < NB * NB; i++) bStart[i + 1] = bStart[i] + counts[i];
+  bList = new Int16Array(bStart[NB * NB] + 1);
+  const fillp = bStart.slice(0, NB * NB);
+  for (let k = 0; k < LN; k++) {
+    const L = lightsRaw[k];
+    const x0 = clamp(Math.floor((L.x - L.rad) / 8), 0, NB - 1), x1 = clamp(Math.floor((L.x + L.rad) / 8), 0, NB - 1);
+    const y0 = clamp(Math.floor((L.y - L.rad) / 8), 0, NB - 1), y1 = clamp(Math.floor((L.y + L.rad) / 8), 0, NB - 1);
+    for (let by = y0; by <= y1; by++) for (let bx = x0; bx <= x1; bx++) bList[fillp[by * NB + bx]++] = k;
+  }
+}
+function bakeGroundLight() {
+  GLR.fill(0); GLG.fill(0); GLB.fill(0);
+  for (let y = PERIM; y < SY - PERIM; y++) for (let x = PERIM; x < SX - PERIM; x++) {
+    const ti = y * SX + x;
+    if (tileKind[ti] === T_BLDG || colTop[ti] > 2 || tileZone[ti] !== 0) continue;
+    const px = x + 0.5, py = y + 0.5;
+    const bi = (y >> 3) * NB + (x >> 3);
+    let r = 0, g = 0, b = 0;
+    for (let q = bStart[bi], qe = bStart[bi + 1]; q < qe; q++) {
+      const k = bList[q];
+      if (LSH[k] !== 1 || LZONE[k] !== 0) continue;
+      const dx = LX[k] - px, dy = LY[k] - py, dz = LZ[k] - 1.0;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 >= LRAD2[k]) continue;
+      const ndl = dz / (Math.sqrt(d2) + 1e-3);
+      let att = 1 - d2 * LINV[k]; att *= att;
+      const kk = att * ndl;
+      if (kk < 0.004) continue;
+      if (!lampVisible(px, py, 1.0, 0, 0, 1, LX[k], LY[k], LZ[k])) continue;
+      r += LRr[k] * kk; g += LGg[k] * kk; b += LBb[k] * kk;
+    }
+    GLR[ti] = r; GLG[ti] = g; GLB[ti] = b;
+  }
+}
+function flickerFactor(id, t, amt) {
+  const q = Math.floor(t * 9);
+  const n = hash3(id, q, 3, SEED);
+  if (n < amt * 0.3) return 0.25 + 0.3 * hash3(id, q, 4, SEED);
+  return 1 - amt * 0.14 * Math.sin(t * 37 + id);
+}
+function updateLightFactors() {
+  for (let k = 0; k < LN; k++) LI[k] = LFL[k] > 0 ? flickerFactor(k, TIME, LFL[k]) : 1;
+  for (let k = 0; k < NEON_MATS.length; k++) neonF[NEON_MATS[k]] = flickerFactor(900 + k, TIME, 0.22);
+  for (let k = 0; k < signs.length; k++) { const s = signs[k]; s.fl = s.flick > 0 ? flickerFactor(2000 + s.id, TIME, s.flick) : 1; }
+}
+
+/* ==========================================================================
+   7. SIGNALS
+   ========================================================================== */
+const SIG_CYCLE = 26;
+let sigNS = 2, sigEW = 0;
+function signalState(axis) {
+  const t = TIME % SIG_CYCLE;
+  if (axis === 1) { if (t < 10) return 2; if (t < 12) return 1; return 0; }
+  if (t < 13) return 0; if (t < 23) return 2; if (t < 25) return 1; return 0;
+}
+function pedWindow(axis) {
+  const t = TIME % SIG_CYCLE;
+  return axis === 1 ? (t >= 12.5 && t <= 15.5) : (t >= 25.5 || t <= 3.5);
+}
+
+/* ==========================================================================
+   8. SURFACES (procedural materials) AND SHADING
+   ========================================================================== */
+const MOON_X = -0.545, MOON_Y = 0.650, MOON_Z = 0.530;
+const SF = new Float64Array(8);   /* surface: SF[0] SF[1] SF[2] SF[3] SF[4] SF[5] gain */
+const SO = new Float64Array(4);   /* shade output: r g b */
+
+function facade(m, ix, iy, iz, axis, u, v) {
+  const bid = tileBid[iy * SX + ix];
+  const nn = hash3(ix, iy, iz, 3);
+  const k = 0.85 + 0.3 * nn;
+  SF[0] *= bTint[bid * 3] * k; SF[1] *= bTint[bid * 3 + 1] * k; SF[2] *= bTint[bid * 3 + 2] * k;
+  if (axis === 2) return;
+  const f = ((iz - 1) / FLOOR_H) | 0, zl = (iz - 1) & 3;
+  if (zl === 0 && v < 0.14) { SF[0] *= 0.6; SF[1] *= 0.6; SF[2] *= 0.6; }
+  const style = bStyle[bid];
+  const w = axis === 0 ? iy : ix;
+  const vok = zl === 1 ? v > 0.22 : (zl === 2 ? v < 0.82 : false);
+  let win = false;
+  if (style === 0) { if ((w & 1) === 0 && vok && u > 0.12 && u < 0.88) win = true; }
+  else if (style === 1) { const p = w % 3; if (p !== 2 && vok && (p === 0 ? u > 0.1 : u < 0.9)) win = true; }
+  else if (style === 2) { if ((zl === 0 ? v > 0.25 : zl < 3) && u > 0.06 && u < 0.94) win = true; }
+  else { if ((w % 3) === 1 && zl === 2 && u > 0.2 && u < 0.8 && v > 0.2 && v < 0.75) win = true; }
+  if (!win) return;
+  const h1 = hash3(w * 7 + axis, f * 3 + (zl >= 2 ? 1 : 0), bid, 11);
+  let lit = h1 < bLit[bid];
+  const h2 = hash3(w, f, bid, 12);
+  if (h2 < 0.07) lit = hash3(w, f, ((TIME * 0.07 + h2 * 40) | 0), 13) < bLit[bid] + 0.1;
+  if (lit) {
+    const c = hash3(w, f, bid, 14);
+    let cr, cg, cb;
+    if (c < 0.62) { cr = 1.5; cg = 1.15; cb = 0.65; }
+    else if (c < 0.84) { cr = 0.5; cg = 1.25; cb = 1.6; }
+    else if (c < 0.94) { cr = 1.6; cg = 0.55; cb = 1.3; }
+    else { cr = 0.7; cg = 1.6; cb = 0.8; }
+    let br = 0.55 + 0.45 * hash3(w, f, bid, 15);
+    if (hash3(w, f, bid, 16) < 0.06) br *= 0.65 + 0.35 * Math.sin(TIME * 11 + h1 * 50);
+    SF[3] = cr * br; SF[4] = cg * br; SF[5] = cb * br;
+    SF[0] = SF[1] = SF[2] = 0.02;
+  } else { SF[0] = 0.025; SF[1] = 0.045; SF[2] = 0.07; SF[6] = 1.6; }
+}
+
+function surface(m, ix, iy, iz, axis, sgn, hx, hy, hz, vidx) {
+  let u, v;
+  if (axis === 0) { u = hy - iy; v = hz - iz; } else if (axis === 1) { u = hx - ix; v = hz - iz; } else { u = hx - ix; v = hy - iy; }
+  const mb = m * 3;
+  SF[0] = matAlb[mb]; SF[1] = matAlb[mb + 1]; SF[2] = matAlb[mb + 2];
+  SF[3] = matEmi[mb]; SF[4] = matEmi[mb + 1]; SF[5] = matEmi[mb + 2];
+  SF[6] = 1;
+  let k;
+  switch (m) {
+    case M_ASPHALT: {
+      k = 0.7 + 0.6 * hash3(ix * 3 + ((u * 3) | 0), iy * 3 + ((v * 3) | 0), 5, SEED);
+      SF[0] *= k; SF[1] *= k; SF[2] *= k;
+      SF[6] = hash3(ix >> 1, iy >> 1, 9, SEED) > 0.82 ? 2.6 : 1.7;
+      break;
+    }
+    case M_SIDEW: case M_CURB: {
+      k = (u < 0.06 || v < 0.06) ? 0.55 : (0.85 + 0.3 * hash3(ix, iy, 6, SEED));
+      SF[0] *= k; SF[1] *= k; SF[2] *= k; SF[6] = 1.15;
+      break;
+    }
+    case M_LINEY: case M_LINEW: {
+      k = 0.7 + 0.3 * hash3(ix * 3 + ((u * 3) | 0), iy * 3 + ((v * 3) | 0), 7, SEED);
+      SF[0] *= k; SF[1] *= k; SF[2] *= k; SF[6] = 1.3;
+      break;
+    }
+    case M_GRASS: k = 0.7 + 0.6 * hash3(ix * 3 + ((u * 3) | 0), iy * 3 + ((v * 3) | 0), 8, SEED); SF[0] *= k; SF[1] *= k; SF[2] *= k; break;
+    case M_CONC: k = 0.75 + 0.5 * hash3(ix * 2 + ((u * 2) | 0), iy * 2 + ((v * 2) | 0), 10, SEED); SF[0] *= k; SF[1] *= k; SF[2] *= k; SF[6] = 1.3; break;
+    case M_WCONC: case M_WBRICK: case M_WGLASS: case M_WPANEL: facade(m, ix, iy, iz, axis, u, v); break;
+    case M_ROOF: {
+      k = (axis === 2 && (u < 0.05 || v < 0.05)) ? 0.6 : (0.85 + 0.3 * hash3(ix, iy, iz, 12));
+      SF[0] *= k; SF[1] *= k; SF[2] *= k;
+      break;
+    }
+    case M_NMAG: case M_NCYA: case M_NAMB: case M_NGRN: case M_NRED: case M_NWHT: {
+      k = neonF[m]; SF[3] *= k; SF[4] *= k; SF[5] *= k;
+      break;
+    }
+    case M_BLINK: {
+      k = Math.sin(TIME * 3 + hash3(ix, iy, 1, SEED) * 6) > 0.55 ? 1 : 0.08;
+      SF[3] *= k; SF[4] *= k; SF[5] *= k;
+      break;
+    }
+    case M_SIGN: {
+      const sg = signMap.get(vidx);
+      if (sg && axis === sg.a) {
+        const s = -sgn;
+        const uu = axis === 1 ? (s > 0 ? sg.x0 + sg.W - hx : hx - sg.x0) : (s > 0 ? hy - sg.y0 : sg.y0 + sg.W - hy);
+        const vv = hz - sg.z0;
+        const bx = clamp(Math.floor(uu / sg.W * sg.bw), 0, sg.bw - 1);
+        const by = clamp(Math.floor((1 - vv / sg.H) * sg.bh), 0, sg.bh - 1);
+        if (sg.bits[by * sg.bw + bx]) { SF[3] = sg.c0 * sg.fl; SF[4] = sg.c1 * sg.fl; SF[5] = sg.c2 * sg.fl; SF[0] = SF[1] = SF[2] = 0.02; }
+        else { SF[3] = sg.c0 * 0.07 * sg.fl; SF[4] = sg.c1 * 0.07 * sg.fl; SF[5] = sg.c2 * 0.07 * sg.fl; SF[0] = SF[1] = SF[2] = 0.03; }
+      } else { SF[0] = SF[1] = SF[2] = 0.05; }
+      break;
+    }
+    case M_TLR: case M_TLY: case M_TLG: {
+      if (axis === 2) break;
+      const st = axis === 1 ? sigNS : sigEW;
+      const on = (m === M_TLR && st === 0) || (m === M_TLY && st === 1) || (m === M_TLG && st === 2);
+      const col = TL_COL[m === M_TLR ? 0 : (m === M_TLY ? 1 : 2)];
+      const dim = on ? 1 : 0.05;
+      SF[3] = col[0] * dim; SF[4] = col[1] * dim; SF[5] = col[2] * dim;
+      break;
+    }
+    case M_BOUND: {
+      if (axis !== 2) {
+        const zl = Math.floor(hz), w = axis === 0 ? hy : hx;
+        if (zl % 6 === 0 && v < 0.35) { SF[3] = 0.9; SF[4] = 0.55; SF[5] = 0.1; }
+        else if ((zl % 6) >= 2 && (zl % 6) <= 4 && hash3(Math.floor(w), (zl / 6) | 0, 21, SEED) < 0.1) { SF[3] = 0.1; SF[4] = 0.5; SF[5] = 0.9; }
+      }
+      break;
+    }
+    case M_FLOORI: {
+      if (axis === 2) {
+        k = ((ix + iy) & 1) ? 1.35 : 0.7;
+        SF[0] *= k; SF[1] *= k; SF[2] *= k;
+        if (u < 0.05 || v < 0.05) { SF[3] = 0.05; SF[4] = 0.22; SF[5] = 0.3; }
+        SF[6] = 0.9;
+      }
+      break;
+    }
+    case M_WALLI: {
+      if (axis !== 2 && iz === 3 && v > 0.5) { SF[3] = 0.5; SF[4] = 0.1; SF[5] = 0.4; }
+      else if (axis !== 2) { k = 0.8 + 0.4 * hash3(ix, iy, iz, 22); SF[0] *= k; SF[1] *= k; SF[2] *= k; }
+      break;
+    }
+    case M_CEIL: if (u < 0.06 || v < 0.06) { SF[0] *= 0.5; SF[1] *= 0.5; SF[2] *= 0.5; } break;
+    case M_BAR: if (axis === 2) { SF[3] = 0.1; SF[4] = 0.55; SF[5] = 0.75; } break;
+    case M_TABLE: if (axis === 2) { SF[3] = 0.35; SF[4] = 0.2; SF[5] = 0.05; } break;
+    case M_STOOL: if (axis === 2) { SF[3] = 0.6; SF[4] = 0.12; SF[5] = 0.5; } break;
+    case M_TERM: {
+      if (axis === 0 && sgn > 0 && iz === 2) {
+        const sc = 0.7 + 0.3 * Math.sin(hz * 40 + TIME * 5);
+        SF[3] = 0.2 * sc; SF[4] = 2.0 * sc; SF[5] = 0.6 * sc;
+      } else if (axis === 0 && sgn > 0) { SF[3] = 0.03; SF[4] = 0.3; SF[5] = 0.1; }
+      break;
+    }
+    case M_SHELF: {
+      if (axis !== 2 && hash3(ix, iz, ((u * 3) | 0) + 3 * axis, 31) < 0.6) {
+        const c = hash3(ix, iz, ((u * 3) | 0), 32);
+        if (c < 0.3) { SF[3] = 1.2; SF[4] = 0.7; SF[5] = 0.2; } else if (c < 0.6) { SF[3] = 0.2; SF[4] = 0.9; SF[5] = 1.2; }
+        else if (c < 0.85) { SF[3] = 1.1; SF[4] = 0.2; SF[5] = 0.8; } else { SF[3] = 0.3; SF[4] = 1.1; SF[5] = 0.4; }
+      }
+      break;
+    }
+    case M_VEND: {
+      const front = tileAux[iy * SX + ix] === 0 ? (axis === 1 && sgn > 0) : (axis === 0 && sgn > 0);
+      if (front) {
+        if (iz === 2) { SF[3] = 1.0; SF[4] = 1.1; SF[5] = 1.3; }
+        else if (hash3(ix, iy, ((u * 2) | 0) + ((v * 3) | 0) * 2, 41) < 0.7) {
+          const c = hash3(ix, iy, ((u * 2) | 0), 42);
+          SF[3] = c < 0.5 ? 1.5 : 0.3; SF[4] = c < 0.5 ? 0.3 : 1.3; SF[5] = 0.9;
+        }
+      }
+      break;
+    }
+    case M_CARB: {
+      const a = tileAux[iy * SX + ix];
+      const pc = CAR_PAINT[((a & 15) || 1) - 1], pos = a >> 4;
+      if (axis !== 2 && pos >= 1 && pos <= 2 && v > 0.40 && v < 0.88) { SF[0] = 0.02; SF[1] = 0.03; SF[2] = 0.05; SF[6] = 2.4; }
+      else { SF[0] = pc[0]; SF[1] = pc[1]; SF[2] = pc[2]; SF[6] = 1.5; }
+      break;
+    }
+    case M_LEAF: k = 0.7 + 0.6 * hash3(ix, iy, iz, 51); SF[0] *= k; SF[1] *= k; SF[2] *= k; break;
+    default: break;
+  }
+}
+
+/* --- cheap 2.5D shadow test for street lamps --- */
+function lampVisible(px, py, pz, nx, ny, nz, lx, ly, lz) {
+  const ax = px + nx * 0.06, ay = py + ny * 0.06, az = pz + nz * 0.06;
+  const dx = lx - ax, dy = ly - ay, dz = lz - az;
+  const l2 = Math.sqrt(dx * dx + dy * dy);
+  const n = Math.ceil(l2 / 1.0);
+  for (let k = 1; k < n; k++) {
+    const f = k / n;
+    const x = ax + dx * f, y = ay + dy * f;
+    if (colTop[(y | 0) * SX + (x | 0)] > az + dz * f + 0.02) return false;
+  }
+  return true;
+}
+
+function shade(px, py, pz, nx, ny, nz, dist, zone, gain) {
+  let lr, lg, lb;
+  if (zone === 0) {
+    const a = CFG.ambient * (0.72 + 0.28 * nz) * (1 - 0.2 * (ny < 0 ? -ny : ny));
+    const mo = nx * MOON_X + ny * MOON_Y + nz * MOON_Z;
+    const a2 = a + (mo > 0 ? mo * 0.22 : 0);
+    lr = a2 * 0.80; lg = a2 * 0.96; lb = a2 * 1.18;
+  } else {
+    const a = CFG.ambientIn * (0.78 + 0.22 * nz);
+    lr = a; lg = a * 0.92; lb = a * 1.08;
+  }
+  const ground = (nz === 1 && pz < 1.02 && zone === 0);
+  let bxi = (px | 0) >> 3, byi = (py | 0) >> 3;
+  if (bxi < 0) bxi = 0; else if (bxi >= NB) bxi = NB - 1;
+  if (byi < 0) byi = 0; else if (byi >= NB) byi = NB - 1;
+  const bi = byi * NB + bxi;
+  for (let q = bStart[bi], qe = bStart[bi + 1]; q < qe; q++) {
+    const k = bList[q];
+    if (LZONE[k] !== zone) continue;
+    if (ground && LSH[k] === 1) continue;
+    const dx = LX[k] - px, dy = LY[k] - py, dz = LZ[k] - pz;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 >= LRAD2[k]) continue;
+    const d = Math.sqrt(d2) + 1e-3;
+    const ndl = (nx * dx + ny * dy + nz * dz) / d;
+    if (ndl <= 0) continue;
+    let att = 1 - d2 * LINV[k]; att *= att;
+    const kk = att * ndl * LI[k];
+    if (kk < 0.004) continue;
+    if (LSH[k] === 1 && kk > 0.06 && dist < 55 && !lampVisible(px, py, pz, nx, ny, nz, LX[k], LY[k], LZ[k])) continue;
+    lr += LRr[k] * kk; lg += LGg[k] * kk; lb += LBb[k] * kk;
+  }
+  if (ground) {
+    const gx = px - 0.5, gy = py - 0.5;
+    const ix = gx | 0, iy = gy | 0, tx = gx - ix, ty = gy - iy;
+    const i0 = iy * SX + ix, w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
+    lr += GLR[i0] * w00 + GLR[i0 + 1] * w10 + GLR[i0 + SX] * w01 + GLR[i0 + SX + 1] * w11;
+    lg += GLG[i0] * w00 + GLG[i0 + 1] * w10 + GLG[i0 + SX] * w01 + GLG[i0 + SX + 1] * w11;
+    lb += GLB[i0] * w00 + GLB[i0 + 1] * w10 + GLB[i0 + SX] * w01 + GLB[i0 + SX + 1] * w11;
+  }
+  if (zone === 0) {
+    for (let k = 0; k < dlN; k++) {
+      const dx = DLX[k] - px, dy = DLY[k] - py, dz = DLZ[k] - pz;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 >= DLRAD2[k]) continue;
+      const d = Math.sqrt(d2) + 1e-3;
+      const ndl = (nx * dx + ny * dy + nz * dz) / d;
+      if (ndl <= 0) continue;
+      let att = 1 - d2 * DLINV[k]; att *= att;
+      const kk = att * ndl;
+      lr += DLR[k] * kk; lg += DLG[k] * kk; lb += DLB[k] * kk;
+    }
+  }
+  let di = (dist * FOGS) | 0; if (di >= FOGN) di = FOGN - 1;
+  const fa = zone === 0 ? FA_O[di] : FA_I[di];
+  const fe = zone === 0 ? FE_O[di] : FE_I[di];
+  const fg = 1 - fa;
+  SO[0] = SF[0] * lr * gain * fa + SF[3] * fe + CFG.fog[0] * fg;
+  SO[1] = SF[1] * lg * gain * fa + SF[4] * fe + CFG.fog[1] * fg;
+  SO[2] = SF[2] * lb * gain * fa + SF[5] * fe + CFG.fog[2] * fg;
+}
+
+/* ==========================================================================
+   9. RAYCASTER (voxel DDA: digital differential analyzer)
+   ========================================================================== */
+const HR = new Float64Array(4);   /* ray results: hit t, glass t */
+let hM = 0, hAxis = 0, hSgn = 0, hIx = 0, hIy = 0, hIz = 0, hIdx = 0;
+let gAxis = 0, gSgn = 0, gIx = 0, gIy = 0, gIz = 0;
+HR[1] = -1;
+
+function castRay(ox, oy, oz, dx, dy, dz, maxT) {
+  let ix = Math.floor(ox), iy = Math.floor(oy), iz = Math.floor(oz);
+  const sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1, sz = dz > 0 ? 1 : -1;
+  const tdx = dx !== 0 ? Math.abs(1 / dx) : 1e30, tdy = dy !== 0 ? Math.abs(1 / dy) : 1e30, tdz = dz !== 0 ? Math.abs(1 / dz) : 1e30;
+  let tmx = dx === 0 ? 1e30 : (dx > 0 ? (ix + 1 - ox) * tdx : (ox - ix) * tdx);
+  let tmy = dy === 0 ? 1e30 : (dy > 0 ? (iy + 1 - oy) * tdy : (oy - iy) * tdy);
+  let tmz = dz === 0 ? 1e30 : (dz > 0 ? (iz + 1 - oz) * tdz : (oz - iz) * tdz);
+  let idx = (iz * SY + iy) * SX + ix;
+  const stx = sx, sty = sy * SX, stz = sz * SXY;
+  let t = 0, axis = 0;
+  HR[1] = -1;
+  for (;;) {
+    if (tmx < tmy) {
+      if (tmx < tmz) { axis = 0; t = tmx; tmx += tdx; ix += sx; idx += stx; }
+      else { axis = 2; t = tmz; tmz += tdz; iz += sz; idx += stz; }
+    } else {
+      if (tmy < tmz) { axis = 1; t = tmy; tmy += tdy; iy += sy; idx += sty; }
+      else { axis = 2; t = tmz; tmz += tdz; iz += sz; idx += stz; }
+    }
+    if (t > maxT) return 0;
+    if ((ix >>> 0) >= SX || (iy >>> 0) >= SY || (iz >>> 0) >= SZ) return 0;
+    let m = vox[idx];
+    if (m === 0) continue;
+    if (matFlags[m] & F_GLASS) {
+      if (HR[1] >= 0) continue;
+      const hx = ox + dx * t, hy = oy + dy * t, hz = oz + dz * t;
+      let u, v;
+      if (axis === 0) { u = hy - iy; v = hz - iz; } else if (axis === 1) { u = hx - ix; v = hz - iz; } else { u = hx - ix; v = hy - iy; }
+      if (u < 0.08 || u > 0.92 || v < 0.06 || v > 0.94) { m = M_DOOR; }
+      else { HR[1] = t; gAxis = axis; gSgn = axis === 0 ? sx : (axis === 1 ? sy : sz); gIx = ix; gIy = iy; gIz = iz; continue; }
+    }
+    HR[0] = t; hM = m; hAxis = axis; hIx = ix; hIy = iy; hIz = iz; hIdx = idx;
+    hSgn = axis === 0 ? sx : (axis === 1 ? sy : sz);
+    return 1;
+  }
+}
+
+/* ==========================================================================
+   10. ENTITIES (cars, pedestrians, bartender)
+   ========================================================================== */
+const PS = 12; /* floats per box part: cx cy cz hx hy hz r g b er eg eb */
+const ents = [], cars = [], peds = [];
+let npc = null;
+let rr = makeRng(7);
+
+function setPart(e, k, cx, cy, cz, hx, hy, hz, c, em) {
+  const o = k * PS, p = e.parts;
+  p[o] = cx; p[o + 1] = cy; p[o + 2] = cz; p[o + 3] = hx; p[o + 4] = hy; p[o + 5] = hz;
+  p[o + 6] = c[0]; p[o + 7] = c[1]; p[o + 8] = c[2];
+  if (em) { p[o + 9] = em[0]; p[o + 10] = em[1]; p[o + 11] = em[2]; } else { p[o + 9] = 0; p[o + 10] = 0; p[o + 11] = 0; }
+}
+function makeCarEntity(id) {
+  const e = { kind: 'car', id, parts: new Float32Array(6 * PS), np: 6, rad: 2.55, hc: 0.9, z0: 1, x: 0, y: 0, yaw: 0, zone: 0, vis: true };
+  const paint = CAR_PAINT[id % CAR_PAINT.length];
+  const neon = NEON_PAL[id % NEON_PAL.length];
+  setPart(e, 0, 0, 0, 0.62, 2.2, 0.95, 0.32, paint);
+  setPart(e, 1, -0.25, 0, 1.2, 1.05, 0.82, 0.26, [0.03, 0.05, 0.08]);
+  setPart(e, 2, 2.2, 0, 0.6, 0.04, 0.7, 0.08, [0.1, 0.1, 0.1], [2.6, 2.4, 1.7]);
+  setPart(e, 3, -2.2, 0, 0.62, 0.04, 0.75, 0.07, [0.1, 0.02, 0.02], [2.4, 0.12, 0.12]);
+  setPart(e, 4, 0, 0, 0.16, 1.95, 0.85, 0.07, [0.02, 0.02, 0.02], [neon[0] * 0.9, neon[1] * 0.9, neon[2] * 0.9]);
+  setPart(e, 5, 0, 0, 0.06, 1.9, 0.9, 0.06, [0.01, 0.01, 0.01]);
+  e.neon = neon;
+  e.bb = [0, 0, 0.78, 2.25, 1.0, 0.7];
+  return e;
+}
+function makePedEntity(id, jacket) {
+  const e = { kind: 'ped', id, parts: new Float32Array(8 * PS), np: 8, rad: 1.05, hc: 0.9, z0: 1, x: 0, y: 0, yaw: 0, zone: 0, vis: true, phase: 0 };
+  const j = jacket;
+  const dark = [0.06, 0.06, 0.09];
+  setPart(e, 0, 0, -0.11, 0.42, 0.09, 0.09, 0.42, dark);
+  setPart(e, 1, 0, 0.11, 0.42, 0.09, 0.09, 0.42, dark);
+  setPart(e, 2, 0, 0, 1.12, 0.13, 0.22, 0.32, [j[0] * 0.28, j[1] * 0.28, j[2] * 0.28]);
+  setPart(e, 3, 0, 0, 1.6, 0.11, 0.11, 0.12, [0.3, 0.26, 0.24]);
+  setPart(e, 4, -0.14, 0, 1.15, 0.012, 0.13, 0.22, [0.02, 0.02, 0.02], [j[0] * 0.9, j[1] * 0.9, j[2] * 0.9]);
+  setPart(e, 5, 0, -0.29, 1.12, 0.07, 0.06, 0.28, [j[0] * 0.2, j[1] * 0.2, j[2] * 0.2]);
+  setPart(e, 6, 0, 0.29, 1.12, 0.07, 0.06, 0.28, [j[0] * 0.2, j[1] * 0.2, j[2] * 0.2]);
+  setPart(e, 7, 0.1, 0, 1.66, 0.14, 0.13, 0.03, [0.02, 0.02, 0.03], [j[0] * 0.5, j[1] * 0.5, j[2] * 0.5]);
+  e.bb = [0, 0, 0.95, 0.4, 0.45, 0.95];
+  return e;
+}
+function animatePed(e) {
+  const s = Math.sin(e.phase), sw = 0.20 * s * e.stride;
+  const p = e.parts;
+  p[0 * PS] = sw; p[1 * PS] = -sw;
+  p[5 * PS] = -sw * 0.8; p[6 * PS] = sw * 0.8;
+  const bob = Math.abs(Math.sin(e.phase)) * 0.03 * e.stride;
+  p[2 * PS + 2] = 1.12 + bob; p[3 * PS + 2] = 1.6 + bob; p[4 * PS + 2] = 1.15 + bob;
+  p[5 * PS + 2] = 1.12 + bob; p[6 * PS + 2] = 1.12 + bob; p[7 * PS + 2] = 1.66 + bob;
+}
+
+/* ---------- cars ---------- */
+const nodeX = (i) => ROAD_C[i], nodeY = (j) => ROAD_C[j];
+function carStartSegment(c, ia, ja, ib, jb) {
+  c.ia = ia; c.ja = ja; c.ib = ib; c.jb = jb;
+  c.dx = ib - ia; c.dy = jb - ja;
+  const rx = c.dy * LANE_OFF, ry = -c.dx * LANE_OFF;
+  c.sx0 = nodeX(ia) + c.dx * ENTRY_D + rx; c.sy0 = nodeY(ja) + c.dy * ENTRY_D + ry;
+  c.segLen = 38 - 2 * ENTRY_D;
+  c.s = 0; c.mode = 0;
+}
+function carChooseTurn(c) {
+  const din = { x: c.dx, y: c.dy };
+  const opts = [];
+  const cand = [[din.x, din.y, 3.2], [din.y, -din.x, 1.3], [-din.y, din.x, 1.3]];
+  for (const o of cand) {
+    const ni = c.ib + o[0], nj = c.jb + o[1];
+    if (ni < 0 || ni > 3 || nj < 0 || nj > 3) continue;
+    opts.push(o);
+  }
+  let tot = 0; for (const o of opts) tot += o[2];
+  let r = rr() * tot, ch = opts[0];
+  for (const o of opts) { r -= o[2]; if (r <= 0) { ch = o; break; } }
+  const dout = { x: ch[0], y: ch[1] };
+  const cx = nodeX(c.ib), cy = nodeY(c.jb);
+  const p0x = cx - din.x * ENTRY_D + din.y * LANE_OFF, p0y = cy - din.y * ENTRY_D - din.x * LANE_OFF;
+  const p2x = cx + dout.x * ENTRY_D + dout.y * LANE_OFF, p2y = cy + dout.y * ENTRY_D - dout.x * LANE_OFF;
+  let p1x, p1y;
+  if (dout.x === din.x && dout.y === din.y) { p1x = (p0x + p2x) / 2; p1y = (p0y + p2y) / 2; }
+  else if (din.x !== 0) { p1x = p2x; p1y = p0y; } else { p1x = p0x; p1y = p2y; }
+  c.b = [p0x, p0y, p1x, p1y, p2x, p2y];
+  c.u = 0; c.mode = 1; c.dout = dout;
+  const straight = dout.x === din.x && dout.y === din.y;
+  c.turnV = straight ? 9.5 : 4.8;
+}
+function carPlace(c) {
+  if (c.mode === 0) {
+    c.x = c.sx0 + c.dx * c.s; c.y = c.sy0 + c.dy * c.s;
+    c.yaw = Math.atan2(c.dy, c.dx);
+  } else {
+    const b = c.b, u = c.u, w = 1 - u;
+    c.x = w * w * b[0] + 2 * u * w * b[2] + u * u * b[4];
+    c.y = w * w * b[1] + 2 * u * w * b[3] + u * u * b[5];
+    const tx = 2 * w * (b[2] - b[0]) + 2 * u * (b[4] - b[2]);
+    const ty = 2 * w * (b[3] - b[1]) + 2 * u * (b[5] - b[3]);
+    c.yaw = Math.atan2(ty, tx);
+  }
+}
+function spawnCars() {
+  cars.length = 0;
+  for (let n = 0; n < CFG.carCount; n++) {
+    const c = makeCarEntity(n);
+    c.vmax = 8.5 + rr() * 3;
+    c.speed = 0; c.waitT = 0; c.ghost = 0;
+    for (let tries = 0; tries < 30; tries++) {
+      const ia = rr() < 0.5 ? Math.floor(rr() * 4) : 0, ja = Math.floor(rr() * 4);
+      let ib = ia, jb = ja;
+      if (rr() < 0.5) { ib = ia + (ia < 3 && (ia === 0 || rr() < 0.5) ? 1 : -1); } else { jb = ja + (ja < 3 && (ja === 0 || rr() < 0.5) ? 1 : -1); }
+      if (ib < 0 || ib > 3 || jb < 0 || jb > 3 || (ib === ia && jb === ja)) continue;
+      carStartSegment(c, ia, ja, ib, jb);
+      c.s = 2 + rr() * (c.segLen - 6);
+      carPlace(c);
+      let ok = true;
+      for (const o of cars) { const dx = o.x - c.x, dy = o.y - c.y; if (dx * dx + dy * dy < 100) { ok = false; break; } }
+      if (ok) break;
+    }
+    c.speed = c.vmax * 0.6;
+    cars.push(c);
+  }
+}
+function updateCar(c, dt) {
+  let vt = c.vmax;
+  if (c.mode === 1) vt = Math.min(vt, c.turnV);
+  const ch = Math.cos(c.yaw), sh = Math.sin(c.yaw);
+  if (c.mode === 0) {
+    const dStop = (c.segLen - 3.2) - c.s;
+    const axis = c.dx !== 0 ? 0 : 1;
+    const st = axis === 0 ? sigEW : sigNS;
+    if (st !== 2 && dStop > -0.6) {
+      const brakeD = c.speed * c.speed / (2 * 4.5);
+      if (st === 0 || brakeD <= dStop) {
+        vt = Math.min(vt, Math.sqrt(2 * 4.0 * Math.max(dStop, 0)));
+        if (dStop < 0.25) vt = 0;
+      }
+    }
+  }
+  let blockedByCar = false;
+  if (c.ghost > 0) c.ghost -= dt;
+  else {
+    let gap = 1e9;
+    for (let n = 0; n < cars.length; n++) {
+      const o = cars[n];
+      if (o === c) continue;
+      const rx = o.x - c.x, ry = o.y - c.y;
+      const f = rx * ch + ry * sh;
+      if (f <= 0 || f > 22) continue;
+      const lat = Math.abs(-rx * sh + ry * ch);
+      if (lat > 1.8) continue;
+      const dot = ch * Math.cos(o.yaw) + sh * Math.sin(o.yaw);
+      if (dot < 0.6 && o.id > c.id) continue;
+      if (f - 4.4 < gap) gap = f - 4.4;
+    }
+    for (let n = 0; n < peds.length; n++) {
+      const p = peds[n];
+      const rx = p.x - c.x, ry = p.y - c.y;
+      const f = rx * ch + ry * sh;
+      if (f <= 0 || f > 9) continue;
+      const lat = Math.abs(-rx * sh + ry * ch);
+      if (lat > 1.5) continue;
+      if (f - 2.3 < gap) gap = f - 2.3;
+    }
+    if (gap < 1e8) {
+      const lim = Math.max(0, (gap - 1.6) * 1.3);
+      if (lim < vt) { vt = lim; blockedByCar = true; }
+    }
+  }
+  if (blockedByCar && c.speed < 0.3) { c.waitT += dt; if (c.waitT > 6) { c.ghost = 3.5; c.waitT = 0; } } else if (!blockedByCar) c.waitT = 0;
+  if (c.speed < vt) c.speed = Math.min(vt, c.speed + 3.0 * dt); else c.speed = Math.max(vt, c.speed - 8.0 * dt);
+  if (c.mode === 0) {
+    c.s += c.speed * dt;
+    if (c.s >= c.segLen) carChooseTurn(c);
+  } else {
+    const b = c.b, u = c.u, w = 1 - u;
+    const tx = 2 * w * (b[2] - b[0]) + 2 * u * (b[4] - b[2]);
+    const ty = 2 * w * (b[3] - b[1]) + 2 * u * (b[5] - b[3]);
+    const dl = Math.max(1, Math.hypot(tx, ty));
+    c.u += c.speed * dt / dl;
+    if (c.u >= 1) {
+      const nia = c.ib, nja = c.jb;
+      carStartSegment(c, nia, nja, nia + c.dout.x, nja + c.dout.y);
+    }
+  }
+  carPlace(c);
+}
+
+/* ---------- pedestrians ---------- */
+function cornerPos(bi, bj, k) {
+  const x0 = BLOCK_O[bi] + 1.5, x1 = BLOCK_O[bi] + 26.5, y0 = BLOCK_O[bj] + 1.5, y1 = BLOCK_O[bj] + 26.5;
+  return k === 0 ? [x0, y0] : (k === 1 ? [x1, y0] : (k === 2 ? [x1, y1] : [x0, y1]));
+}
+const CROSS_MAP = { west: { 0: 1, 3: 2 }, east: { 1: 0, 2: 3 }, south: { 0: 3, 1: 2 }, north: { 3: 0, 2: 1 } };
+const JACKETS = [[1.7, 0.25, 1.2], [0.2, 1.3, 1.8], [1.8, 1.0, 0.2], [0.35, 1.7, 0.4], [1.9, 0.2, 0.2], [0.8, 0.8, 0.9], [0.6, 0.4, 1.9]];
+function spawnPeds() {
+  peds.length = 0;
+  for (let n = 0; n < CFG.pedCount; n++) {
+    const p = makePedEntity(n, JACKETS[n % JACKETS.length]);
+    p.bi = Math.floor(rr() * 3); p.bj = Math.floor(rr() * 3);
+    if (n < 4) { p.bi = 1; p.bj = 0; }
+    p.dir = rr() < 0.5 ? 1 : -1;
+    p.k = Math.floor(rr() * 4);
+    const prev = cornerPos(p.bi, p.bj, (p.k - p.dir + 4) % 4), tar = cornerPos(p.bi, p.bj, p.k);
+    const f = rr();
+    p.x = prev[0] + (tar[0] - prev[0]) * f; p.y = prev[1] + (tar[1] - prev[1]) * f;
+    p.tx = tar[0]; p.ty = tar[1];
+    p.speed = 1.0 + rr() * 0.8; p.stride = 1;
+    p.mode = 0; p.pause = 6 + rr() * 20; p.pauseT = 0; p.yaw = Math.atan2(p.ty - p.y, p.tx - p.x);
+    p.cross = null; p.phase = rr() * 6;
+    peds.push(p);
+  }
+}
+function pedAtCorner(p) {
+  if (rr() < 0.32) {
+    const opts = [];
+    if (p.k === 0 || p.k === 3) { if (p.bi > 0) opts.push('west'); }
+    if (p.k === 1 || p.k === 2) { if (p.bi < 2) opts.push('east'); }
+    if (p.k === 0 || p.k === 1) { if (p.bj > 0) opts.push('south'); }
+    if (p.k === 2 || p.k === 3) { if (p.bj < 2) opts.push('north'); }
+    if (opts.length) {
+      const dir = opts[Math.floor(rr() * opts.length)];
+      const nbi = p.bi + (dir === 'west' ? -1 : (dir === 'east' ? 1 : 0));
+      const nbj = p.bj + (dir === 'south' ? -1 : (dir === 'north' ? 1 : 0));
+      const nk = CROSS_MAP[dir][p.k];
+      const tgt = cornerPos(nbi, nbj, nk);
+      p.cross = { axis: (dir === 'west' || dir === 'east') ? 1 : 0, nbi, nbj, nk, tx: tgt[0], ty: tgt[1] };
+      p.mode = 1;
+      return;
+    }
+  }
+  p.k = (p.k + p.dir + 4) % 4;
+  const t = cornerPos(p.bi, p.bj, p.k);
+  p.tx = t[0]; p.ty = t[1];
+}
+function updatePed(p, dt) {
+  let moving = true;
+  if (p.mode === 1) {
+    if (pedWindow(p.cross.axis)) {
+      p.mode = 2; p.tx = p.cross.tx; p.ty = p.cross.ty; p.speed = Math.max(p.speed, 1.4);
+    } else moving = false;
+  }
+  if (p.pauseT > 0) { p.pauseT -= dt; moving = false; }
+  else if (p.mode === 0) { p.pause -= dt; if (p.pause <= 0) { p.pause = 8 + rr() * 22; p.pauseT = 1.5 + rr() * 3; } }
+  if (moving) {
+    const dx = P.x - p.x, dy = P.y - p.y, d = Math.hypot(dx, dy);
+    if (d < 1.1 && (dx * Math.cos(p.yaw) + dy * Math.sin(p.yaw)) > 0) moving = false;
+  }
+  if (moving) {
+    const dx = p.tx - p.x, dy = p.ty - p.y, d = Math.hypot(dx, dy);
+    const step = p.speed * dt;
+    const want = Math.atan2(dy, dx);
+    let da = want - p.yaw; while (da > Math.PI) da -= 2 * Math.PI; while (da < -Math.PI) da += 2 * Math.PI;
+    p.yaw += da * Math.min(1, 9 * dt);
+    if (d <= step + 0.02) {
+      p.x = p.tx; p.y = p.ty;
+      if (p.mode === 2) {
+        p.bi = p.cross.nbi; p.bj = p.cross.nbj; p.k = p.cross.nk; p.cross = null; p.mode = 0;
+        p.dir = rr() < 0.5 ? 1 : -1;
+        p.k = (p.k + p.dir + 4) % 4;
+        const t = cornerPos(p.bi, p.bj, p.k); p.tx = t[0]; p.ty = t[1];
+        p.speed = 1.0 + rr() * 0.8;
+      } else pedAtCorner(p);
+    } else { p.x += dx / d * step; p.y += dy / d * step; }
+    p.phase += p.speed * dt * 4.4;
+    p.stride += (1 - p.stride) * Math.min(1, dt * 6);
+  } else { p.stride += (0 - p.stride) * Math.min(1, dt * 6); }
+  animatePed(p);
+}
+
+/* ==========================================================================
+   11. PLAYER, INPUT, COLLISION
+   ========================================================================== */
+const P = { x: 64, y: 42.5, yaw: Math.PI / 2, pitch: 0, vx: 0, vy: 0, bob: 0, fov: CFG.fovDeg, speedN: 0 };
+const keys = Object.create(null);
+let pointerLocked = false, dragging = false, lookFallback = false;
+
+function blockedAt(tx, ty) { if (tx < 0 || ty < 0 || tx >= SX || ty >= SY) return true; return blocked[ty * SX + tx] === 1; }
+function hitsWall(x, y) {
+  const r = CFG.radius;
+  const x0 = Math.floor(x - r), x1 = Math.floor(x + r), y0 = Math.floor(y - r), y1 = Math.floor(y + r);
+  for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) {
+    if (!blockedAt(tx, ty)) continue;
+    const cx = clamp(x, tx, tx + 1), cy = clamp(y, ty, ty + 1);
+    const dx = x - cx, dy = y - cy;
+    if (dx * dx + dy * dy < r * r) return true;
+  }
+  return false;
+}
+function moveCircle(dx, dy) {
+  const nx = P.x + dx; if (!hitsWall(nx, P.y)) P.x = nx; else P.vx = 0;
+  const ny = P.y + dy; if (!hitsWall(P.x, ny)) P.y = ny; else P.vy = 0;
+}
+function pushFromEntities() {
+  const r = CFG.radius;
+  for (let n = 0; n < cars.length; n++) {
+    const c = cars[n];
+    const dx = P.x - c.x, dy = P.y - c.y;
+    if (dx * dx + dy * dy > 16) continue;
+    const cs = Math.cos(c.yaw), sn = Math.sin(c.yaw);
+    let lx = cs * dx + sn * dy, ly = -sn * dx + cs * dy;
+    const hx = 2.2 + r, hy = 0.95 + r;
+    if (Math.abs(lx) < hx && Math.abs(ly) < hy) {
+      const px = hx - Math.abs(lx), py = hy - Math.abs(ly);
+      if (px < py) lx = (lx >= 0 ? 1 : -1) * hx; else ly = (ly >= 0 ? 1 : -1) * hy;
+      P.x = c.x + cs * lx - sn * ly; P.y = c.y + sn * lx + cs * ly;
+    }
+  }
+  for (let n = 0; n <= peds.length; n++) {
+    const p = n < peds.length ? peds[n] : npc;
+    if (!p) continue;
+    const dx = P.x - p.x, dy = P.y - p.y, d = Math.hypot(dx, dy), m = r + 0.28;
+    if (d < m && d > 1e-4) { P.x = p.x + dx / d * m; P.y = p.y + dy / d * m; }
+  }
+}
+function updatePlayer(dt) {
+  const fw = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0), st = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+  if (keys.ArrowLeft) P.yaw += 1.9 * dt;
+  if (keys.ArrowRight) P.yaw -= 1.9 * dt;
+  if (keys.ArrowUp) P.pitch = clamp(P.pitch + 1.4 * dt, -1.4, 1.4);
+  if (keys.ArrowDown) P.pitch = clamp(P.pitch - 1.4 * dt, -1.4, 1.4);
+  const sprint = (keys.ShiftLeft || keys.ShiftRight) && fw > 0;
+  const spd = sprint ? CFG.sprint : CFG.walk;
+  let tvx = 0, tvy = 0;
+  if (fw !== 0 || st !== 0) {
+    const l = Math.hypot(fw, st), c = Math.cos(P.yaw), s = Math.sin(P.yaw);
+    tvx = (c * fw + s * st) / l * spd; tvy = (s * fw - c * st) / l * spd;
+  }
+  const k = 1 - Math.exp(-CFG.accel * dt);
+  P.vx += (tvx - P.vx) * k; P.vy += (tvy - P.vy) * k;
+  const steps = Math.max(1, Math.ceil(Math.hypot(P.vx, P.vy) * dt / 0.25));
+  for (let i = 0; i < steps; i++) moveCircle(P.vx * dt / steps, P.vy * dt / steps);
+  pushFromEntities();
+  const sp = Math.hypot(P.vx, P.vy);
+  P.speedN = clamp(sp / CFG.walk, 0, 2);
+  P.bob += sp * dt * 1.7;
+  const tf = CFG.fovDeg + (sprint ? 7 : 0);
+  P.fov += (tf - P.fov) * Math.min(1, dt * 6);
+}
+function updateInteraction() {
+  let best = null, bd = 1e9;
+  const cy = Math.cos(P.yaw), sy = Math.sin(P.yaw);
+  for (const it of interactables) {
+    const dx = it.x - P.x, dy = it.y - P.y, d = Math.hypot(dx, dy);
+    if (d > it.r) continue;
+    const align = d < 0.9 ? 1 : (dx * cy + dy * sy) / d;
+    if (align < 0.3) continue;
+    if (d < bd) { bd = d; best = it; }
+  }
+  game.cur = best;
+}
+
+/* ==========================================================================
+   12. RENDERER (raycast, entities, character mapping)
+   ========================================================================== */
+const RAMP = ' .\'`^",:;Il!i><~+?][}{1)(tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$';
+const RN = RAMP.length;
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16 - 0.5);
+const TMS = 256, TMN = 1024;
+const TM = new Float32Array(TMN);
+for (let i = 0; i < TMN; i++) TM[i] = 1 - Math.exp(-(i / TMS) * 1.8);
+
+let Rcols = 0, Rrows = 0, Rcw = 8, Rch = 16;
+let depthT, bufR, bufG, bufB, nrmB, matB, varB, glassB, lenBuf, colF, rowF;
+let cChar, cR, cG, cB, cBg;
+let camX = 0, camY = 0, camZ = 0, camFx = 0, camFy = 0, camFz = 0, camRx = 0, camRy = 0, camUx = 0, camUy = 0, camUz = 0;
+let tanHX = 1, tanHY = 1;
+const MAXT = CFG.viewDist;
+
+function rendererResize(cols, rows, cw, ch) {
+  Rcols = cols; Rrows = rows; Rcw = cw; Rch = ch;
+  const n = cols * rows;
+  depthT = new Float32Array(n); bufR = new Float32Array(n); bufG = new Float32Array(n); bufB = new Float32Array(n);
+  nrmB = new Uint8Array(n); matB = new Uint8Array(n); varB = new Uint8Array(n); glassB = new Float32Array(n);
+  lenBuf = new Float32Array(n); colF = new Float32Array(cols); rowF = new Float32Array(rows);
+  cChar = new Uint8Array(n); cR = new Uint8Array(n); cG = new Uint8Array(n); cB = new Uint8Array(n); cBg = new Uint8Array(n);
+}
+function computeCamera() {
+  const bobA = Math.min(1, P.speedN) * 0.045;
+  camX = P.x + Math.cos(P.bob) * 0.02 * Math.min(1, P.speedN) * Math.sin(P.yaw);
+  camY = P.y - Math.cos(P.bob) * 0.02 * Math.min(1, P.speedN) * Math.cos(P.yaw);
+  camZ = 1 + CFG.eye + Math.sin(P.bob * 2) * bobA;
+  const cp = Math.cos(P.pitch), sp = Math.sin(P.pitch), cy = Math.cos(P.yaw), sy = Math.sin(P.yaw);
+  camFx = cp * cy; camFy = cp * sy; camFz = sp;
+  camRx = sy; camRy = -cy;
+  camUx = -sp * cy; camUy = -sp * sy; camUz = cp;
+  tanHX = Math.tan(P.fov * Math.PI / 360);
+  tanHY = tanHX * (Rrows * Rch) / (Rcols * Rcw);
+  for (let x = 0; x < Rcols; x++) colF[x] = ((x + 0.5) / Rcols * 2 - 1) * tanHX;
+  for (let y = 0; y < Rrows; y++) rowF[y] = (1 - (y + 0.5) / Rrows * 2) * tanHY;
+  for (let y = 0; y < Rrows; y++) { const rf = rowF[y]; for (let x = 0; x < Rcols; x++) { const cf = colF[x]; lenBuf[y * Rcols + x] = Math.sqrt(1 + cf * cf + rf * rf); } }
+}
+const dlIdx = new Int16Array(64), dlD2 = new Float32Array(64);
+function updateDynamicLights() {
+  dlN = 0;
+  let nc = 0;
+  for (let n = 0; n < cars.length && nc < 60; n++) {
+    const c = cars[n];
+    const dx = c.x - P.x, dy = c.y - P.y, d2 = dx * dx + dy * dy;
+    if (d2 >= 2500) continue;
+    let k = nc++;
+    while (k > 0 && dlD2[k - 1] > d2) { dlD2[k] = dlD2[k - 1]; dlIdx[k] = dlIdx[k - 1]; k--; }
+    dlD2[k] = d2; dlIdx[k] = n;
+  }
+  for (let n = 0; n < nc && dlN + 2 <= MAXDL; n++) {
+    const c = cars[dlIdx[n]], cs = Math.cos(c.yaw), sn = Math.sin(c.yaw);
+    DLX[dlN] = c.x + cs * 3.6; DLY[dlN] = c.y + sn * 3.6; DLZ[dlN] = 1.5;
+    DLR[dlN] = 1.0; DLG[dlN] = 0.95; DLB[dlN] = 0.8; DLRAD2[dlN] = 144; DLINV[dlN] = 1 / 144; dlN++;
+    DLX[dlN] = c.x; DLY[dlN] = c.y; DLZ[dlN] = 1.3;
+    DLR[dlN] = c.neon[0] * 1.2; DLG[dlN] = c.neon[1] * 1.2; DLB[dlN] = c.neon[2] * 1.2; DLRAD2[dlN] = 30; DLINV[dlN] = 1 / 30; dlN++;
+  }
+}
+function skyCell(i, dx, dy, dz, len) {
+  const dzn = dz / len;
+  let r = 0, g = 0, b = 0;
+  if (dzn < 0.35) {
+    const h = dzn < 0 ? 1 : Math.exp(-dzn * 6.5);
+    r = CFG.fog[0] * h * 1.4; g = CFG.fog[1] * h * 1.4; b = CFG.fog[2] * h * 1.4;
+  }
+  const cosang = (dx * MOON_X + dy * MOON_Y + dz * MOON_Z) / len;
+  if (cosang > 0.9985) {
+    const n = 0.65 + 0.35 * hash3(Math.floor(dx / len * 90), Math.floor(dy / len * 90), Math.floor(dzn * 90), 3);
+    r = 1.3 * n; g = 1.35 * n; b = 1.4 * n;
+  } else if (cosang > 0.996) { const w = (cosang - 0.996) / 0.0025; r += 0.12 * w; g += 0.13 * w; b += 0.15 * w; }
+  else if (dzn > 0.03) {
+    const a = Math.atan2(dy, dx), e = Math.asin(dzn);
+    const hs = hash3(Math.floor(a * 110), Math.floor(e * 110), 77, SEED);
+    if (hs > 0.9955) { const tw = 0.65 + 0.35 * Math.sin(TIME * 2.5 + hs * 300); const s = 0.85 * tw; r = s * 0.85; g = s * 0.95; b = s; }
+  }
+  bufR[i] = r; bufG[i] = g; bufB[i] = b;
+  depthT[i] = 1e9; nrmB[i] = 0; matB[i] = 0; varB[i] = 0; glassB[i] = -1;
+}
+function traceCell(i, dx, dy, dz, len) {
+  if (!castRay(camX, camY, camZ, dx, dy, dz, MAXT)) { glassB[i] = -1; skyCell(i, dx, dy, dz, len); return; }
+  const t = HR[0], m = hM, axis = hAxis, sgn = hSgn;
+  const hx = camX + dx * t, hy = camY + dy * t, hz = camZ + dz * t;
+  let nx = 0, ny = 0, nz = 0;
+  if (axis === 0) nx = -sgn; else if (axis === 1) ny = -sgn; else nz = -sgn;
+  let zx = hIx, zy = hIy;
+  if (axis === 0) zx -= sgn; else if (axis === 1) zy -= sgn;
+  const zone = tileZone[zy * SX + zx];
+  surface(m, hIx, hIy, hIz, axis, sgn, hx, hy, hz, hIdx);
+  shade(hx, hy, hz, nx, ny, nz, t * len, zone, SF[6]);
+  let r = SO[0], g = SO[1], b = SO[2];
+  if (HR[1] >= 0) {
+    const gt = HR[1];
+    const ghx = camX + dx * gt, ghy = camY + dy * gt, ghz = camZ + dz * gt;
+    let gnx = 0, gny = 0, gnz = 0;
+    if (gAxis === 0) gnx = -gSgn; else if (gAxis === 1) gny = -gSgn; else gnz = -gSgn;
+    let gzx = gIx, gzy = gIy;
+    if (gAxis === 0) gzx -= gSgn; else if (gAxis === 1) gzy -= gSgn;
+    SF[0] = 0.05; SF[1] = 0.13; SF[2] = 0.17; SF[3] = 0; SF[4] = 0; SF[5] = 0;
+    shade(ghx, ghy, ghz, gnx, gny, gnz, gt * len, tileZone[gzy * SX + gzx], 2.2);
+    r = r * 0.68 + SO[0] * 0.7 + 0.008; g = g * 0.72 + SO[1] * 0.7 + 0.014; b = b * 0.78 + SO[2] * 0.7 + 0.018;
+  }
+  bufR[i] = r; bufG[i] = g; bufB[i] = b;
+  depthT[i] = t; matB[i] = m; glassB[i] = HR[1];
+  nrmB[i] = axis * 2 + (-sgn > 0 ? 1 : 2);
+  varB[i] = (hash3(Math.floor(hx * 3), Math.floor(hy * 3), Math.floor(hz * 3), SEED) * 255) | 0;
+}
+
+function entitiesPass() {
+  const cols = Rcols, rows = Rrows;
+  for (let n = 0; n < ents.length; n++) {
+    const e = ents[n];
+    const ex = e.x - camX, ey = e.y - camY, ez = e.z0 + e.hc - camZ;
+    const zf = ex * camFx + ey * camFy + ez * camFz;
+    const rad = e.rad;
+    if (zf < -rad) continue;
+    if (ex * ex + ey * ey + ez * ez > MAXT * MAXT) continue;
+    let x0, x1, y0, y1;
+    if (zf < rad * 1.05 || zf < 0.5) { x0 = 0; x1 = cols - 1; y0 = 0; y1 = rows - 1; }
+    else {
+      const sx = (ex * camRx + ey * camRy) / zf / tanHX;
+      const sy = (ex * camUx + ey * camUy + ez * camUz) / zf / tanHY;
+      const wx = rad / zf / tanHX, wy = rad / zf / tanHY;
+      x0 = Math.floor(((sx - wx) + 1) * 0.5 * cols - 0.5) - 1; x1 = Math.ceil(((sx + wx) + 1) * 0.5 * cols - 0.5) + 1;
+      y0 = Math.floor((1 - (sy + wy)) * 0.5 * rows - 0.5) - 1; y1 = Math.ceil((1 - (sy - wy)) * 0.5 * rows - 0.5) + 1;
+      if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > cols - 1) x1 = cols - 1; if (y1 > rows - 1) y1 = rows - 1;
+      if (x0 > x1 || y0 > y1) continue;
+    }
+    const cs = Math.cos(e.yaw), sn = Math.sin(e.yaw);
+    const rx = camX - e.x, ry = camY - e.y;
+    const olx = cs * rx + sn * ry, oly = -sn * rx + cs * ry, olz = camZ - e.z0;
+    const parts = e.parts, np = e.np, bb = e.bb;
+    for (let y = y0; y <= y1; y++) {
+      const rf = rowF[y];
+      const bx = camFx + camUx * rf, by = camFy + camUy * rf, bz = camFz + camUz * rf;
+      for (let x = x0; x <= x1; x++) {
+        const i = y * cols + x;
+        const cf = colF[x];
+        const dx = bx + camRx * cf, dy = by + camRy * cf, dz = bz;
+        let ldx = cs * dx + sn * dy, ldy = -sn * dx + cs * dy;
+        if (ldx > -1e-9 && ldx < 1e-9) ldx = 1e-9;
+        if (ldy > -1e-9 && ldy < 1e-9) ldy = 1e-9;
+        const ldz = (dz > -1e-9 && dz < 1e-9) ? 1e-9 : dz;
+        const ix = 1 / ldx, iy = 1 / ldy, iz = 1 / ldz;
+        let bestT = depthT[i], bestP = -1, bestA = 0, bestS = 0;
+        {
+          let q1 = (bb[0] - bb[3] - olx) * ix, q2 = (bb[0] + bb[3] - olx) * ix, qn, qf;
+          if (q1 < q2) { qn = q1; qf = q2; } else { qn = q2; qf = q1; }
+          q1 = (bb[1] - bb[4] - oly) * iy; q2 = (bb[1] + bb[4] - oly) * iy;
+          if (q1 < q2) { if (q1 > qn) qn = q1; if (q2 < qf) qf = q2; } else { if (q2 > qn) qn = q2; if (q1 < qf) qf = q1; }
+          q1 = (bb[2] - bb[5] - olz) * iz; q2 = (bb[2] + bb[5] - olz) * iz;
+          if (q1 < q2) { if (q1 > qn) qn = q1; if (q2 < qf) qf = q2; } else { if (q2 > qn) qn = q2; if (q1 < qf) qf = q1; }
+          if (qn > qf || qf < 0.03 || qn > bestT) continue;
+        }
+        for (let k = 0; k < np; k++) {
+          const o = k * PS;
+          const hx = parts[o + 3], hy = parts[o + 4], hz = parts[o + 5];
+          const cx = parts[o], cy = parts[o + 1], cz = parts[o + 2];
+          let t1 = (cx - hx - olx) * ix, t2 = (cx + hx - olx) * ix;
+          let tn, tf, na = 0, ns;
+          if (t1 < t2) { tn = t1; tf = t2; ns = -1; } else { tn = t2; tf = t1; ns = 1; }
+          let a1 = (cy - hy - oly) * iy, a2 = (cy + hy - oly) * iy, an, af;
+          if (a1 < a2) { an = a1; af = a2; } else { an = a2; af = a1; }
+          if (an > tn) { tn = an; na = 1; ns = ldy > 0 ? -1 : 1; }
+          if (af < tf) tf = af;
+          else if (false) { /* keep */ }
+          if (na === 0) ns = ldx > 0 ? -1 : 1;
+          let b1 = (cz - hz - olz) * iz, b2 = (cz + hz - olz) * iz, bn, bf;
+          if (b1 < b2) { bn = b1; bf = b2; } else { bn = b2; bf = b1; }
+          if (bn > tn) { tn = bn; na = 2; ns = ldz > 0 ? -1 : 1; }
+          if (bf < tf) tf = bf;
+          if (tn > tf || tf < 0.03 || tn < 0.03) continue;
+          if (tn < bestT) { bestT = tn; bestP = o; bestA = na; bestS = ns; }
+        }
+        if (bestP < 0) continue;
+        const t = bestT;
+        const hxw = camX + dx * t, hyw = camY + dy * t, hzw = camZ + dz * t;
+        let nx, ny, nz;
+        if (bestA === 0) { nx = cs * bestS; ny = sn * bestS; nz = 0; }
+        else if (bestA === 1) { nx = -sn * bestS; ny = cs * bestS; nz = 0; }
+        else { nx = 0; ny = 0; nz = bestS; }
+        SF[0] = parts[bestP + 6]; SF[1] = parts[bestP + 7]; SF[2] = parts[bestP + 8];
+        SF[3] = parts[bestP + 9]; SF[4] = parts[bestP + 10]; SF[5] = parts[bestP + 11];
+        const len = lenBuf[i];
+        shade(hxw, hyw, hzw, nx, ny, nz, t * len, e.zone, 1.6);
+        let r = SO[0], g = SO[1], b = SO[2];
+        if (glassB[i] >= 0 && t > glassB[i]) { r = r * 0.7 + 0.01; g = g * 0.75 + 0.02; b = b * 0.8 + 0.03; }
+        bufR[i] = r; bufG[i] = g; bufB[i] = b;
+        depthT[i] = t; matB[i] = 255; nrmB[i] = bestA * 2 + (bestS > 0 ? 1 : 2);
+        varB[i] = (hash3(Math.floor(hxw * 4), Math.floor(hyw * 4), Math.floor(hzw * 4), SEED) * 255) | 0;
+      }
+    }
+  }
+}
+
+function isFar(dn, d) { return dn > d * 1.3 + 0.9; }
+function finalizeChars() {
+  const cols = Rcols, rows = Rrows;
+  const K1 = (RN - 1) / 0.94 * 0.98;
+  const edgeMaxT = CFG.edgeMax;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const i = y * cols + x;
+      const r = bufR[i], g = bufG[i], b = bufB[i];
+      const v = r > g ? (r > b ? r : b) : (g > b ? g : b);
+      const tmv = TM[v * TMS >= TMN ? TMN - 1 : (v * TMS) | 0];
+      let lf = (tmv - 0.06) * K1;
+      if (lf < 0) lf = 0;
+      let ii = Math.floor(lf + BAYER[((y & 3) << 2) | (x & 3)] + 0.5);
+      if (ii > 4) { const vv = varB[i]; ii += vv < 56 ? -1 : (vv > 200 ? 1 : 0); if (tmv > 0.8 && hash3(i, (TIME * 8) | 0, 5, SEED) > 0.93) ii += 1; }
+      if (ii < 0) ii = 0; else if (ii >= RN) ii = RN - 1;
+      let code = RAMP.charCodeAt(ii);
+      let tm2 = tmv;
+      const d = depthT[i];
+      if (d < 1e8 && d * lenBuf[i] < edgeMaxT && !(matFlags[matB[i]] & F_NOEDGE) && matB[i] !== 255 && tmv < 0.8) {
+        const nA = nrmB[i];
+        let ve = false, he = false;
+        if (x + 1 < cols) {
+          const j = i + 1, dj = depthT[j];
+          if (isFar(dj, d)) ve = true;
+          else if (nrmB[j] !== nA && nrmB[j] !== 0 && Math.abs(dj - d) < d * 0.2 + 0.5) ve = true;
+        }
+        if (!ve && x > 0 && isFar(depthT[i - 1], d)) ve = true;
+        if (y + 1 < rows) {
+          const j = i + cols, dj = depthT[j];
+          if (!(nA === 5 && nrmB[j] === 5)) {
+            if (isFar(dj, d)) he = true;
+            else if (nrmB[j] !== nA && nrmB[j] !== 0 && Math.abs(dj - d) < d * 0.2 + 0.5) he = true;
+          }
+        }
+        if (!he && y > 0 && !(nA === 5 && nrmB[i - cols] === 5) && isFar(depthT[i - cols], d)) he = true;
+        if (ve || he) {
+          code = (ve && he) ? 43 : (ve ? 124 : 45);
+          tm2 = Math.max(tmv, 0.2) * 1.12; if (tm2 > 1) tm2 = 1;
+        }
+      }
+      cChar[i] = code - 32;
+      if (v > 1e-5) {
+        const inv = (0.32 + 0.68 * tm2) / v * 255;
+        const R = r * inv, G = g * inv, B = b * inv;
+        cR[i] = R > 255 ? 255 : R; cG[i] = G > 255 ? 255 : G; cB[i] = B > 255 ? 255 : B;
+      } else { cR[i] = 40; cG[i] = 70; cB[i] = 90; }
+      cBg[i] = tmv > 0.5 ? (((tmv - 0.5) * 0.5 * 256) | 0) : 0;
+    }
+  }
+}
+
+let rainOn = false;
+function rainPass() {
+  const cols = Rcols, rows = Rrows;
+  for (let x = 0; x < cols; x++) {
+    const sp = 16 + hash3(x, 1, 2, SEED) * 12, off = hash3(x, 2, 3, SEED) * 100;
+    for (let y = 0; y < rows; y++) {
+      const ry = Math.floor(y + TIME * sp + off);
+      if (hash3(x, ry, 11, SEED) < 0.014) {
+        const i = y * cols + x;
+        if (cChar[i] < 12) { cChar[i] = 124 - 32; cR[i] = 90; cG[i] = 150; cB[i] = 190; cBg[i] = 0; }
+      }
+    }
+  }
+}
+
+function renderScene() {
+  computeCamera();
+  updateLightFactors();
+  updateDynamicLights();
+  const cols = Rcols, rows = Rrows;
+  for (let y = 0; y < rows; y++) {
+    const rf = rowF[y];
+    const bx = camFx + camUx * rf, by = camFy + camUy * rf, bz = camFz + camUz * rf;
+    for (let x = 0; x < cols; x++) {
+      const i = y * cols + x, cf = colF[x];
+      traceCell(i, bx + camRx * cf, by + camRy * cf, bz, lenBuf[i]);
+    }
+  }
+  entitiesPass();
+  finalizeChars();
+  if (rainOn) rainPass();
+}
+
+/* ==========================================================================
+   13. HUD (drawn into the character grid)
+   ========================================================================== */
+function putText(x, y, s, r, g, b) {
+  if (y < 0 || y >= Rrows) return;
+  for (let k = 0; k < s.length; k++) {
+    const xx = x + k;
+    if (xx < 0 || xx >= Rcols) continue;
+    const i = y * Rcols + xx;
+    const c = s.charCodeAt(k);
+    cChar[i] = (c >= 32 && c <= 126) ? c - 32 : 0;
+    cR[i] = r; cG[i] = g; cB[i] = b; cBg[i] = 0;
+  }
+}
+function clearRect(x0, y0, w, h) {
+  for (let y = y0; y < y0 + h; y++) for (let x = x0; x < x0 + w; x++) {
+    if (x < 0 || y < 0 || x >= Rcols || y >= Rrows) continue;
+    const i = y * Rcols + x; cChar[i] = 0; cBg[i] = 0;
+  }
+}
+function districtAt(x, y) {
+  x = Math.floor(x); y = Math.floor(y);
+  if (x < PERIM || y < PERIM || x >= SX - PERIM || y >= SY - PERIM) return 'PERIMETER WALL';
+  const rx = roadIdx(x), ry = roadIdx(y);
+  if (rx >= 0 && ry >= 0) return 'JUNCTION ' + String.fromCharCode(65 + rx) + (ry + 1);
+  if (rx >= 0) return 'AVENUE ' + (rx + 1);
+  if (ry >= 0) return 'STREET ' + (ry + 1);
+  let bi = 0, bj = 0;
+  for (let k = 0; k < 3; k++) { if (x >= BLOCK_O[k]) bi = k; if (y >= BLOCK_O[k]) bj = k; }
+  return DISTRICTS[bj * 3 + bi];
+}
+function compass(yaw) {
+  const deg = ((90 - yaw * 180 / Math.PI) % 360 + 360) % 360;
+  const names = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  return names[Math.round(deg / 45) % 8] + ' ' + Math.round(deg);
+}
+let fpsShown = 0, frameMsShown = 0;
+function drawHud() {
+  const G = [110, 255, 170], D = [70, 170, 120], Y = [255, 210, 90];
+  const cols = Rcols, rows = Rrows;
+  const l1 = ' FPS ' + fpsShown + '  POS ' + P.x.toFixed(1) + ' ' + P.y.toFixed(1) + ' ' + (1 + CFG.eye).toFixed(1) + '  HDG ' + compass(P.yaw) + ' ';
+  const blockName = districtAt(P.x, P.y);
+  const l2 = ' DISTRICT ' + blockName + ' ';
+  const l3 = ' SEED ' + SEED + '  CREDITS ' + game.credits + ' ';
+  clearRect(0, 0, l1.length, 1); clearRect(0, 1, l2.length, 1); clearRect(cols - l3.length, 0, l3.length, 1);
+  putText(0, 0, l1, G[0], G[1], G[2]); putText(0, 1, l2, Y[0], Y[1], Y[2]); putText(cols - l3.length, 0, l3, D[0] + 40, D[1] + 40, D[2] + 40);
+  const hint = ' WASD MOVE  SHIFT SPRINT  MOUSE LOOK  E USE  ESC UNLOCK  R RAIN  N NEW SEED  1-3 RES ';
+  if (rows > 8) { clearRect(0, rows - 1, Math.min(cols, hint.length), 1); putText(0, rows - 1, hint.substring(0, cols), D[0], D[1], D[2]); }
+  /* crosshair */
+  const cx = cols >> 1, cy = rows >> 1;
+  const ci = cy * cols + cx;
+  cChar[ci] = 43 - 32; cR[ci] = 160; cG[ci] = 255; cB[ci] = 200; cBg[ci] = 0;
+  /* prompt */
+  if (game.cur) {
+    const s = ' [E] ' + game.cur.label() + ' ';
+    const x = Math.max(0, (cols - s.length) >> 1), y = Math.min(rows - 3, Math.floor(rows * 0.68));
+    clearRect(x, y, s.length, 1); putText(x, y, s, 255, 240, 140);
+  }
+  /* message panel */
+  if (game.msg && TIME < game.msgUntil) {
+    let w = 0; for (const l of game.msg) w = Math.max(w, l.length);
+    w += 4; const h = game.msg.length + 2;
+    const x = Math.max(0, (cols - w) >> 1), y = Math.max(2, Math.floor(rows * 0.76) - (h >> 1));
+    clearRect(x, y, w, h);
+    const top = '+' + '-'.repeat(w - 2) + '+';
+    putText(x, y, top, G[0], G[1], G[2]); putText(x, y + h - 1, top, G[0], G[1], G[2]);
+    for (let k = 0; k < game.msg.length; k++) {
+      putText(x, y + 1 + k, '|', G[0], G[1], G[2]); putText(x + w - 1, y + 1 + k, '|', G[0], G[1], G[2]);
+      putText(x + 2, y + 1 + k, game.msg[k], 200, 255, 220);
+    }
+  }
+}
+
+/* ==========================================================================
+   14. DISPLAY (glyph atlas and pixel blit to the canvas)
+   ========================================================================== */
+const Display = (function () {
+  const canvas = document.getElementById('screen');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  let W = 0, cw = 8, ch = 16, cols = 0, rows = 0, img = null, u32 = null, scale = 1;
+  let gOff = [], gCov = [];
+  function buildAtlas() {
+    const off = document.createElement('canvas');
+    off.width = cw; off.height = ch;
+    const c2 = off.getContext('2d', { willReadFrequently: true });
+    const fs = Math.round(ch * 0.84);
+    c2.font = 'bold ' + fs + 'px "Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,"Courier New",monospace';
+    c2.textAlign = 'center'; c2.textBaseline = 'alphabetic';
+    const base = Math.round(ch * 0.79);
+    const Wp = cols * cw;
+    gOff = new Array(95); gCov = new Array(95);
+    gOff[0] = new Int32Array(0); gCov[0] = new Uint8Array(0);
+    for (let g = 1; g < 95; g++) {
+      c2.clearRect(0, 0, cw, ch);
+      c2.fillStyle = '#fff';
+      c2.fillText(String.fromCharCode(32 + g), cw / 2, base);
+      const d = c2.getImageData(0, 0, cw, ch).data;
+      let n = 0;
+      for (let p = 0; p < cw * ch; p++) if (d[p * 4 + 3] > 12) n++;
+      const o = new Int32Array(n), cv = new Uint8Array(n);
+      let q = 0;
+      for (let yy = 0; yy < ch; yy++) for (let xx = 0; xx < cw; xx++) {
+        const a = d[(yy * cw + xx) * 4 + 3];
+        if (a > 12) { o[q] = yy * Wp + xx; cv[q] = Math.min(255, Math.round(a * 1.15 + 6)); q++; }
+      }
+      gOff[g] = o; gCov[g] = cv;
+    }
+  }
+  function layout() {
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = window.innerWidth, cssH = window.innerHeight;
+    scale = (dpr >= 1.5 && cssW * cssH * 4 <= 3.4e6) ? 2 : 1;
+    W = cssW * scale;
+    const Hh = cssH * scale;
+    const target = CFG.colSteps[CFG.quality];
+    cw = clamp(Math.round(W / target), 4, 20);
+    ch = cw * 2;
+    cols = Math.max(20, Math.floor(W / cw)); rows = Math.max(10, Math.floor(Hh / ch));
+    canvas.width = cols * cw; canvas.height = rows * ch;
+    canvas.style.width = (cols * cw / scale) + 'px'; canvas.style.height = (rows * ch / scale) + 'px';
+    img = ctx.createImageData(canvas.width, canvas.height);
+    u32 = new Uint32Array(img.data.buffer);
+    buildAtlas();
+    rendererResize(cols, rows, cw, ch);
+  }
+  function present() {
+    u32.fill(0xFF000000);
+    const Wp = canvas.width;
+    for (let cy = 0; cy < rows; cy++) {
+      for (let cx = 0; cx < cols; cx++) {
+        const i = cy * cols + cx;
+        const g = cChar[i], bgS = cBg[i];
+        if (g === 0 && bgS === 0) continue;
+        const R = cR[i], G = cG[i], B = cB[i];
+        const base = cy * ch * Wp + cx * cw;
+        let bR = 0, bG = 0, bB = 0;
+        if (bgS) {
+          bR = (R * bgS) >> 8; bG = (G * bgS) >> 8; bB = (B * bgS) >> 8;
+          const bp = 0xFF000000 | (bB << 16) | (bG << 8) | bR;
+          for (let yy = 0; yy < ch; yy++) { const o = base + yy * Wp; for (let xx = 0; xx < cw; xx++) u32[o + xx] = bp; }
+        }
+        if (g !== 0) {
+          const offs = gOff[g], cov = gCov[g], n = offs.length;
+          if (bgS) {
+            for (let k = 0; k < n; k++) {
+              const c = cov[k];
+              u32[base + offs[k]] = 0xFF000000 | ((bB + (((B - bB) * c) >> 8)) << 16) | ((bG + (((G - bG) * c) >> 8)) << 8) | (bR + (((R - bR) * c) >> 8));
+            }
+          } else {
+            for (let k = 0; k < n; k++) {
+              const c = cov[k];
+              u32[base + offs[k]] = 0xFF000000 | (((B * c) >> 8) << 16) | (((G * c) >> 8) << 8) | ((R * c) >> 8);
+            }
+          }
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+  return { canvas, layout, present, get cols() { return cols; }, get rows() { return rows; } };
+})();
+
+/* ==========================================================================
+   15. INPUT
+   ========================================================================== */
+let needLayout = false;
+const overlay = document.getElementById('overlay');
+function setOverlay(show) {
+  if (show) {
+    overlay.textContent = 'NEON GRID  //  ASCII CITY\n\nCLICK TO CAPTURE THE MOUSE\n\nWASD  move        SHIFT  sprint\nMOUSE  look       E  interact\nESC  release mouse\n\nNo pointer lock? Drag with the mouse\nor use the arrow keys to look.';
+    overlay.className = '';
+  } else overlay.className = 'hidden';
+}
+function requestLock() {
+  try {
+    const p = Display.canvas.requestPointerLock && Display.canvas.requestPointerLock();
+    if (p && p.catch) p.catch(() => { lookFallback = true; });
+  } catch (e) { lookFallback = true; }
+}
+function regenerate(seed) {
+  generateCity(seed);
+  spawnWorldEntities();
+  P.x = world.spawn.x; P.y = world.spawn.y; P.yaw = world.spawn.yaw; P.pitch = 0; P.vx = P.vy = 0;
+}
+function onKeyDown(e) {
+  if (e.repeat && e.code === 'KeyE') return;
+  keys[e.code] = true;
+  if (e.code === 'KeyE') { if (game.cur) game.cur.act(); }
+  else if (e.code === 'KeyR') rainOn = !rainOn;
+  else if (e.code === 'KeyN') { regenerate((Math.random() * 1e9) >>> 0); }
+  else if (e.code === 'Digit1') { CFG.quality = 1; CFG.autoQuality = false; Display.layout(); }
+  else if (e.code === 'Digit2') { CFG.quality = 3; CFG.autoQuality = false; Display.layout(); }
+  else if (e.code === 'Digit3') { CFG.quality = 5; CFG.autoQuality = false; Display.layout(); }
+  else if (e.code === 'Digit0') { CFG.autoQuality = true; }
+  if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
+}
+function initInput() {
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+  window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+  window.addEventListener('resize', () => { needLayout = true; });
+  document.addEventListener('pointerlockchange', () => {
+    pointerLocked = document.pointerLockElement === Display.canvas;
+    setOverlay(!pointerLocked && !dragging);
+  });
+  document.addEventListener('pointerlockerror', () => { lookFallback = true; });
+  Display.canvas.addEventListener('mousedown', (e) => {
+    if (!pointerLocked) { requestLock(); dragging = true; setOverlay(false); }
+  });
+  window.addEventListener('mouseup', () => { dragging = false; });
+  window.addEventListener('mousemove', (e) => {
+    if (pointerLocked || dragging) {
+      P.yaw -= (e.movementX || 0) * CFG.mouseSens;
+      P.pitch = clamp(P.pitch - (e.movementY || 0) * CFG.mouseSens, -1.45, 1.45);
+    }
+  });
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+}
+
+/* ==========================================================================
+   16. GAME LOOP
+   ========================================================================== */
+function spawnWorldEntities() {
+  ents.length = 0;
+  rr = makeRng(SEED ^ 0x5bd1e995);
+  spawnCars(); spawnPeds();
+  npc = makePedEntity(99, [1.2, 0.3, 0.9]);
+  npc.x = 64; npc.y = 66.5; npc.yaw = -Math.PI / 2; npc.zone = 1; npc.stride = 0; npc.phase = 0;
+  animatePed(npc);
+  for (const c of cars) ents.push(c);
+  for (const p of peds) ents.push(p);
+  ents.push(npc);
+}
+function update(dt) {
+  TIME += dt;
+  sigNS = signalState(1); sigEW = signalState(0);
+  updatePlayer(dt);
+  for (let n = 0; n < cars.length; n++) updateCar(cars[n], dt);
+  for (let n = 0; n < peds.length; n++) updatePed(peds[n], dt);
+  npc.yaw = -Math.PI / 2 + Math.sin(TIME * 0.7) * 0.25;
+  updateInteraction();
+}
+function dumpFrame() {
+  let s = '';
+  for (let y = 0; y < Rrows; y++) { let line = ''; for (let x = 0; x < Rcols; x++) line += String.fromCharCode(32 + cChar[y * Rcols + x]); s += line + '\n'; }
+  return s;
+}
+
+let lastT = 0, frames = 0, fpsT = 0, emaWork = 8, slowCount = 0, fastCount = 0;
+function frame(now) {
+  if (needLayout) { needLayout = false; Display.layout(); }
+  const dt = Math.min(0.05, Math.max(0.0001, (now - lastT) / 1000));
+  lastT = now;
+  const w0 = performance.now();
+  update(dt);
+  renderScene();
+  drawHud();
+  Display.present();
+  const work = performance.now() - w0;
+  emaWork += (work - emaWork) * 0.1;
+  frames++; fpsT += dt;
+  if (fpsT >= 0.5) { fpsShown = Math.round(frames / fpsT); frames = 0; fpsT = 0; }
+  if (CFG.autoQuality) {
+    if (emaWork > 13.5) { slowCount++; fastCount = 0; } else if (emaWork < 6.5) { fastCount++; slowCount = 0; } else { slowCount = 0; fastCount = 0; }
+    if (slowCount > 40 && CFG.quality > 0) { CFG.quality--; slowCount = 0; emaWork = 9; Display.layout(); }
+    else if (fastCount > 240 && CFG.quality < 4) { CFG.quality++; fastCount = 0; emaWork = 9; Display.layout(); }
+  }
+  requestAnimationFrame(frame);
+}
+
+function boot() {
+  SEED = parseSeedFromUrl();
+  Display.layout();
+  regenerate(SEED);
+  initInput();
+  setOverlay(true);
+  window.__ASCII_CITY = {
+    CFG, P, ents, cars, peds, game, world, interactables, buildings, vox, blocked, tileKind,
+    update, render: renderScene, hud: drawHud, dump: dumpFrame, regenerate, layout: Display.layout,
+    present: Display.present, keys, castRay, districtAt,
+    lastHit: function () { return { t: HR[0], m: hM, axis: hAxis, ix: hIx, iy: hIy, iz: hIz }; },
+    exportFrame: function () { return { raw: Array.from(bufR).map((v, i) => Math.max(v, bufG[i], bufB[i])), depth: Array.from(depthT), cols: Rcols, rows: Rrows, ch: Array.from(cChar), r: Array.from(cR), g: Array.from(cG), b: Array.from(cB), bg: Array.from(cBg) }; },
+    get cols() { return Rcols; }, get rows() { return Rrows; }, get time() { return TIME; }, get lights() { return LN; }
+  };
+  lastT = performance.now();
+  requestAnimationFrame(frame);
+}
+boot();
+})();
+</script>
+</body>
+</html>
