@@ -1,11 +1,32 @@
-
 # LLM-ascii-city-test
-walkable ASCII cyberpunk city in a single html file.
+Walkable ASCII cyberpunk city in a single HTML file — the same prompt given to different LLMs.
 
-- GPT-6 version https://lowlight-ascii-city.jl117.chatgpt.site/
-- Opus 5.5 version https://jaakkolipp.github.io/opus5-5-ascii-city-test/
-- Sonnet 5.5 version Opus 5.5 version https://jaakkolipp.github.io/opus5-5-ascii-city-test/index_1.html
+**Portal:** https://jaakkolipp.github.io/LLM-ascii-city-test/ — lists every demo automatically, grouped by the model that made it.
 
+## Repository layout
+
+```
+index.html                  portal page (GitHub Pages root)
+models/
+  <model-slug>/             one folder per LLM, e.g. claude-opus-5-5
+    model.json              optional: {"name", "vendor", "notes", "links": [{"title","url"}]}
+    index.html              the demo (any number of *.html files per model)
+    run-2.html              ...extra attempts show up as extra links
+scripts/build-manifest.mjs  scans models/ and writes demos.json
+.github/workflows/pages.yml builds demos.json and deploys the site on push to main
+```
+
+## Adding a demo
+
+1. Create `models/<model-slug>/` (lowercase, dashes) and drop the HTML file(s) in.
+2. Optionally add `model.json` with a display name/vendor (otherwise the name is derived from the slug).
+   Externally hosted demos can be listed via `links` (see `models/gpt-6/model.json`).
+3. Push to `main`. The workflow regenerates `demos.json` and redeploys; the link text is the file's `<title>`.
+
+Local preview: `node scripts/build-manifest.mjs && python3 -m http.server`, then open http://localhost:8000.
+
+One-time setup: in *Settings → Pages*, set **Source** to **GitHub Actions**.
+(If Pages is instead served straight from the branch, the portal falls back to listing `models/` via the GitHub API.)
 
 ### prompt
 Build a browser-based first-person 3D exploration game inspired by the concept of a walkable ASCII cyberpunk city.
