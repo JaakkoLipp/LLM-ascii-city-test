@@ -1,9 +1,10 @@
 
-# opus 5.5 test
+# LLM-ascii-city-test
 walkable ASCII cyberpunk city in a single html file.
 
 - GPT-6 version https://lowlight-ascii-city.jl117.chatgpt.site/
 - Opus 5.5 version https://jaakkolipp.github.io/opus5-5-ascii-city-test/
+- Sonnet 5.5 version Opus 5.5 version https://jaakkolipp.github.io/opus5-5-ascii-city-test/index_1.html
 
 
 ### prompt
